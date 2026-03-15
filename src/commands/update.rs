@@ -5,7 +5,6 @@ use cargo_metadata::MetadataCommand;
 use clap::Parser;
 
 use crate::{
-    buckify::flush_root,
     cache::BuckalCache,
     context::BuckalContext,
     utils::{UnwrapOrExit, ensure_prerequisites, get_last_cache, section},
@@ -51,7 +50,6 @@ pub fn execute(args: &UpdateArgs) {
     }
 
     let ctx = BuckalContext::new(args.manifest_path.clone());
-    flush_root(&ctx);
 
     let new_cache = BuckalCache::new(&ctx.nodes_map, &ctx.workspace_root);
     let changes = new_cache.diff(&last_cache, &ctx.workspace_root);

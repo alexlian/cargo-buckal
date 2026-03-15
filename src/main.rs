@@ -21,7 +21,7 @@ pub const RUST_CRATES_ROOT: &str = "third-party/rust/crates";
 pub const RUST_GIT_ROOT: &str = "third-party/rust/git";
 pub const BUCKAL_BUNDLES_REPO: &str = "buck2hub/buckal-bundles";
 // fallback commit hash used when fetching the latest from BUCKAL_BUNDLES_REPO fails
-pub const DEFAULT_BUNDLE_HASH: &str = "bb154eeec3fc42390eeb995ccb3b1f2893864fc8";
+pub const DEFAULT_BUNDLE_HASH: &str = "b8ec5f1bb851ef6e572acdcd912b82f3edbfb932";
 
 pub fn main() {
     let args = cli::Cli::parse();

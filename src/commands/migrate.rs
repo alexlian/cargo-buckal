@@ -7,7 +7,6 @@ use crate::{
     assets::extract_buck2_assets,
     buck2::Buck2Command,
     buckal_error,
-    buckify::flush_root,
     bundles::{fetch_buckal_cell, init_buckal_cell, init_modifier},
     cache::BuckalCache,
     context::BuckalContext,
@@ -114,8 +113,6 @@ pub fn execute(args: &MigrateArgs) {
     let mut ctx = BuckalContext::new(args.manifest_path.clone());
     ctx.no_merge = !args.merge;
 
-    // Process the root node
-    flush_root(&ctx);
     // Process dep nodes
     let last_cache = if args.no_cache || BuckalCache::load().is_err() {
         BuckalCache::new_empty()

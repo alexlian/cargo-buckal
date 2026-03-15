@@ -5,12 +5,13 @@ use cargo_util_schemas::lockfile::TomlLockfileSourceId;
 
 use crate::{
     buck::{
-        BuildscriptRun, CargoManifest, CargoTargetKind, FileGroup, GitFetch, Glob, HttpArchive,
-        RustBinary, RustLibrary, RustRule, RustTest,
+        BuildscriptRun, CargoManifest, CargoTargetKind, ExportFile, FileGroup, GitFetch, Glob,
+        HttpArchive, RustBinary, RustLibrary, RustRule, RustTest,
     },
+    buckify::actions::is_third_party,
     context::BuckalContext,
     platform::{buck_labels, lookup_platforms},
-    utils::{UnwrapOrExit, get_cfgs, get_target, get_vendor_path_relative},
+    utils::{UnwrapOrExit, get_buck2_root, get_cfgs, get_target, get_vendor_path_relative},
 };
 
 use super::deps::{dep_kind_matches, set_deps};
@@ -337,10 +338,37 @@ pub(super) fn emit_git_fetch(package: &Package) -> GitFetch {
 }
 
 /// Emit `cargo_manifest` rule for the given package
-pub(super) fn emit_cargo_manifest() -> CargoManifest {
-    CargoManifest {
-        name: "manifest".to_owned(),
-        vendor: get_vendor_target(),
+pub(super) fn emit_cargo_manifest(package: &Package, ctx: &BuckalContext) -> CargoManifest {
+    if !is_third_party(package) && ctx.workspace_inherit {
+        let buck2_root = get_buck2_root().unwrap_or_exit_ctx("failed to get Buck2 root");
+        let workspace_root = ctx.workspace_root.to_owned();
+        let relative_path = workspace_root
+            .strip_prefix(&buck2_root)
+            .unwrap_or_exit_ctx("failed to get relative path from Buck2 root to workspace root");
+        CargoManifest {
+            name: "manifest".to_owned(),
+            vendor: get_vendor_target(),
+            workspace: format!(
+                "//{}:workspace",
+                normalize_path_for_buck(relative_path.as_str())
+            )
+            .into(),
+        }
+    } else {
+        CargoManifest {
+            name: "manifest".to_owned(),
+            vendor: get_vendor_target(),
+            workspace: None,
+        }
+    }
+}
+
+/// Emit `export_file` rule for the workspace Cargo.toml
+pub(super) fn emit_export_file() -> ExportFile {
+    ExportFile {
+        name: "workspace".to_owned(),
+        src: "Cargo.toml".to_string(),
+        visibility: Set::from(["PUBLIC".to_owned()]),
     }
 }
 
