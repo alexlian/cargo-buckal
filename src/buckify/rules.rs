@@ -145,6 +145,16 @@ pub fn buckify_root_node(node: &Node, ctx: &BuckalContext) -> Vec<Rule> {
 
     let manifest_dir = package.manifest_path.parent().unwrap().to_owned();
 
+    // Pre-compute the library Buck target name for wiring binary → library deps.
+    // In Cargo, every binary in a package implicitly depends on the package's library.
+    let lib_buck_name: Option<String> = lib_targets.first().map(|lib_target| {
+        if bin_targets.iter().any(|b| b.name == lib_target.name) {
+            format!("{}-lib", lib_target.name)
+        } else {
+            lib_target.name.to_owned()
+        }
+    });
+
     // emit filegroup rule for vendor
     let filegroup = emit_filegroup();
     buck_rules.push(Rule::FileGroup(filegroup));
@@ -159,11 +169,11 @@ pub fn buckify_root_node(node: &Node, ctx: &BuckalContext) -> Vec<Rule> {
         let mut rust_binary =
             emit_rust_binary(&package, node, bin_target, &manifest_dir, &buckal_name, ctx);
 
-        if lib_targets.iter().any(|l| l.name == bin_target.name) {
-            // Cargo allows `main.rs` to use items from `lib.rs` via the crate's own name by default.
-            rust_binary
-                .deps_mut()
-                .insert(format!(":{}-lib", bin_target.name));
+        // Cargo allows `main.rs` to use items from `lib.rs` via the crate's own name by default.
+        // The binary must always depend on the sibling library, even when names differ
+        // (e.g., binary "my-crate" vs library "my_crate").
+        if let Some(lib_name) = &lib_buck_name {
+            rust_binary.deps_mut().insert(format!(":{lib_name}"));
         }
 
         buck_rules.push(Rule::RustBinary(rust_binary));
