@@ -355,9 +355,9 @@ pub fn platform_exists(platform_target: &str) -> bool {
     }
 }
 
+/// Check if the current directory is a valid Buck2 package.
 pub fn check_buck2_package() -> Result<()> {
-    // This function checks if the current directory is a valid Buck2 package.
-    let cwd = std::env::current_dir().expect("Failed to get current directory");
+    let cwd = std::env::current_dir()?;
     let buck_file = cwd.join("BUCK");
     if !buck_file.exists() {
         bail!(
@@ -366,6 +366,16 @@ pub fn check_buck2_package() -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Check if the current directory is inside a Buck2 project.
+pub fn is_inside_buck2_project() -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    if find_buck2_project_root(&cwd).is_some() {
+        Ok(())
+    } else {
+        bail!("Not inside a Buck2 project.");
+    }
 }
 
 pub fn get_target() -> String {
