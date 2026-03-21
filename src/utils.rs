@@ -14,7 +14,7 @@ use inquire::Select;
 
 use crate::buck2::Buck2Command;
 use crate::cache::BuckalCache;
-use crate::{RUST_CRATES_ROOT, RUST_GIT_ROOT};
+use crate::{RUST_CRATES_ROOT, RUST_GIT_ROOT, RUST_LOCAL_ROOT};
 
 #[macro_export]
 macro_rules! buckal_log {
@@ -468,6 +468,13 @@ pub fn get_vendor_path_relative(package_id: &PackageId) -> Result<String> {
         )),
         SourceKind::Git(_) => Ok(format!(
             "{RUST_GIT_ROOT}/{}/{}",
+            package_id_spec.name(),
+            package_id_spec
+                .version()
+                .expect("failed to extract package version")
+        )),
+        SourceKind::Path => Ok(format!(
+            "{RUST_LOCAL_ROOT}/{}/{}",
             package_id_spec.name(),
             package_id_spec
                 .version()

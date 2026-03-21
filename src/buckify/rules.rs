@@ -43,15 +43,10 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             buck_rules.push(Rule::HttpArchive(http_archive));
         }
         SourceKind::Path => {
-            buckal_error!(
-                "Local path ({}) is not supported for third-party packages.",
-                package_id_spec.url().unwrap().path()
-            );
-            buckal_note!(
-                "Please consider importing `{}` with registry or git source instead, or if it's a local package, move it to the workspace and it will be treated as a root package.",
-                node.name
-            );
-            std::process::exit(1);
+            // External path dependency — sources are copied into the vendor directory
+            // during vendor_package(). Use a filegroup to reference them.
+            let filegroup = emit_filegroup();
+            buck_rules.push(Rule::FileGroup(filegroup));
         }
         SourceKind::Git(_) => {
             let git_fetch = emit_git_fetch(node);
@@ -243,7 +238,49 @@ pub fn vendor_package(node: &BuckalNode) -> Utf8PathBuf {
         std::fs::create_dir_all(&vendor_dir).expect("Failed to create target directory");
     }
 
+    // For path dependencies, copy the source tree into the vendor directory.
+    // Registry and git sources are fetched at build time by buck2 rules.
+    let package_id_spec =
+        PackageIdSpec::parse(&node.package_id.repr).unwrap_or_exit_ctx("failed to parse package ID");
+    if let Some(SourceKind::Path) = package_id_spec.kind() {
+        let source_dir = node.manifest_path.parent().unwrap();
+        copy_path_dep_sources(source_dir.as_std_path(), vendor_dir.as_std_path());
+    }
+
     vendor_dir
+}
+
+/// Copy source files from a path dependency into the vendor directory.
+///
+/// Only copies Cargo.toml, src/, and build.rs — excludes target/, .git, etc.
+fn copy_path_dep_sources(source: &std::path::Path, dest: &std::path::Path) {
+    use fs_extra::dir::CopyOptions;
+
+    // Copy Cargo.toml
+    let manifest = source.join("Cargo.toml");
+    if manifest.exists() {
+        std::fs::copy(&manifest, dest.join("Cargo.toml"))
+            .expect("Failed to copy Cargo.toml from path dependency");
+    }
+
+    // Copy src/ directory
+    let src_dir = source.join("src");
+    if src_dir.is_dir() {
+        let dest_src = dest.join("src");
+        if dest_src.exists() {
+            std::fs::remove_dir_all(&dest_src).expect("Failed to clean existing src/ in vendor");
+        }
+        let opts = CopyOptions::new().overwrite(true);
+        fs_extra::dir::copy(&src_dir, dest, &opts)
+            .expect("Failed to copy src/ from path dependency");
+    }
+
+    // Copy build.rs if present
+    let build_rs = source.join("build.rs");
+    if build_rs.exists() {
+        std::fs::copy(&build_rs, dest.join("build.rs"))
+            .expect("Failed to copy build.rs from path dependency");
+    }
 }
 
 /// Generate the content of the BUCK file based on the given rules, including conditional load statements for used rule types.
