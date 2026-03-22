@@ -29,6 +29,7 @@ impl Rule {
         match self {
             Rule::RustLibrary(inner) => Some(inner),
             Rule::RustBinary(inner) => Some(inner),
+            Rule::RustTest(inner) => Some(inner),
             _ => None,
         }
     }
