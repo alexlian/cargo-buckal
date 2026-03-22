@@ -250,36 +250,51 @@ pub fn vendor_package(node: &BuckalNode) -> Utf8PathBuf {
     vendor_dir
 }
 
+/// Directories that should never be vendored from path dependencies.
+/// These are build artifacts, VCS metadata, and tool state that are not
+/// part of the crate's source and would bloat the vendor directory.
+const VENDOR_EXCLUDE_DIRS: &[&str] = &[
+    "target",
+    ".git",
+    "buck-out",
+    ".buckal",
+    "node_modules",
+    ".hg",
+];
+
 /// Copy source files from a path dependency into the vendor directory.
 ///
-/// Only copies Cargo.toml, src/, and build.rs — excludes target/, .git, etc.
+/// Copies the full source tree except for well-known build artifact and VCS
+/// directories (see [`VENDOR_EXCLUDE_DIRS`]). This ensures that build scripts
+/// can access all source files they need (e.g. `.proto` files, migrations,
+/// templates) via `CARGO_MANIFEST_DIR`.
 fn copy_path_dep_sources(source: &std::path::Path, dest: &std::path::Path) {
     use fs_extra::dir::CopyOptions;
 
-    // Copy Cargo.toml
-    let manifest = source.join("Cargo.toml");
-    if manifest.exists() {
-        std::fs::copy(&manifest, dest.join("Cargo.toml"))
-            .expect("Failed to copy Cargo.toml from path dependency");
-    }
+    for entry in std::fs::read_dir(source).expect("Failed to read path dependency directory") {
+        let entry = entry.expect("Failed to read directory entry");
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
 
-    // Copy src/ directory
-    let src_dir = source.join("src");
-    if src_dir.is_dir() {
-        let dest_src = dest.join("src");
-        if dest_src.exists() {
-            std::fs::remove_dir_all(&dest_src).expect("Failed to clean existing src/ in vendor");
+        if VENDOR_EXCLUDE_DIRS.iter().any(|exc| *exc == &*name_str) {
+            continue;
         }
-        let opts = CopyOptions::new().overwrite(true);
-        fs_extra::dir::copy(&src_dir, dest, &opts)
-            .expect("Failed to copy src/ from path dependency");
-    }
 
-    // Copy build.rs if present
-    let build_rs = source.join("build.rs");
-    if build_rs.exists() {
-        std::fs::copy(&build_rs, dest.join("build.rs"))
-            .expect("Failed to copy build.rs from path dependency");
+        let dest_path = dest.join(&name);
+        let file_type = entry.file_type().expect("Failed to get file type");
+
+        if file_type.is_file() {
+            std::fs::copy(entry.path(), &dest_path)
+                .expect("Failed to copy file from path dependency");
+        } else if file_type.is_dir() {
+            if dest_path.exists() {
+                std::fs::remove_dir_all(&dest_path)
+                    .expect("Failed to clean existing directory in vendor");
+            }
+            let opts = CopyOptions::new().overwrite(true);
+            fs_extra::dir::copy(entry.path(), dest, &opts)
+                .expect("Failed to copy directory from path dependency");
+        }
     }
 }
 
