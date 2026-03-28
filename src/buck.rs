@@ -92,6 +92,8 @@ pub struct CargoManifest {
 pub struct ExportFile {
     pub name: String,
     pub src: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     pub visibility: Set<String>,
 }
 
@@ -835,10 +837,12 @@ impl ExportFile {
     fn from_kwargs(kwargs: &RuleKwargs) -> anyhow::Result<Self> {
         let name = kwargs.get_str("name")?;
         let src = kwargs.get_str("src")?;
+        let mode = kwargs.get_str_opt("mode");
         let visibility = kwargs.get_list("visibility");
         Ok(ExportFile {
             name,
             src,
+            mode,
             visibility,
         })
     }
@@ -1725,6 +1729,7 @@ mod tests {
         let expected = Rule::ExportFile(ExportFile {
             name: "workspace".to_string(),
             src: "Cargo.toml".to_string(),
+            mode: Some("reference".to_string()),
             visibility: Set::from(["PUBLIC".to_string()]),
         });
         let actual = rules
