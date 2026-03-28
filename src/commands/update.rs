@@ -32,7 +32,7 @@ pub struct UpdateArgs {
 pub fn execute(args: &UpdateArgs) {
     ensure_prerequisites().unwrap_or_exit();
 
-    let last_cache = get_last_cache();
+    let last_cache = get_last_cache(args.manifest_path.as_deref());
 
     handle_cargo_update(args).unwrap_or_exit_ctx("failed to execute cargo update");
 
@@ -51,7 +51,7 @@ pub fn execute(args: &UpdateArgs) {
 
     let ctx = BuckalContext::new(args.manifest_path.clone());
 
-    let new_cache = BuckalCache::new(&ctx.nodes_map, &ctx.workspace_root);
+    let new_cache = BuckalCache::from_resolve(&ctx.resolve, &ctx.workspace_root);
     let changes = new_cache.diff(&last_cache, &ctx.workspace_root);
 
     changes.apply(&ctx);

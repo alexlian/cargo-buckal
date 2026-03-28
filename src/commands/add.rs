@@ -49,7 +49,7 @@ pub fn execute(args: &AddArgs) {
 
     check_buck2_package().unwrap_or_exit();
 
-    let last_cache = get_last_cache();
+    let last_cache = get_last_cache(args.manifest_path.as_deref());
 
     if args.workspace {
         // TODO: Check current implementation of workspace mode
@@ -69,7 +69,7 @@ pub fn execute(args: &AddArgs) {
 
     let ctx = BuckalContext::new(args.manifest_path.clone());
 
-    let new_cache = BuckalCache::new(&ctx.nodes_map, &ctx.workspace_root);
+    let new_cache = BuckalCache::from_resolve(&ctx.resolve, &ctx.workspace_root);
     let changes = new_cache.diff(&last_cache, &ctx.workspace_root);
 
     changes.apply(&ctx);

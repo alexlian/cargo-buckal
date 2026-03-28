@@ -1,5 +1,4 @@
-use cargo_metadata::{Package, camino::Utf8Path};
-use cargo_util_schemas::core::PackageIdSpec;
+use cargo_metadata::camino::Utf8Path;
 use regex::Regex;
 
 use crate::{
@@ -8,7 +7,8 @@ use crate::{
     buckify::emit::emit_export_file,
     cache::{BuckalChange, ChangeType},
     context::BuckalContext,
-    utils::{UnwrapOrExit, get_buck2_root, get_url_path, get_vendor_dir},
+    resolve::{BuckalNode, NodeKind},
+    utils::{UnwrapOrExit, get_vendor_dir},
 };
 
 use super::{
@@ -27,25 +27,23 @@ impl BuckalChange {
         for (id, change_type) in &self.changes {
             match change_type {
                 ChangeType::Added | ChangeType::Changed => {
-                    if let Some(node) = ctx.nodes_map.get(id) {
-                        let package = ctx.packages_map.get(id).unwrap();
-
+                    if let Some(node) = ctx.resolve.nodes().find(|n| &n.package_id == id) {
                         buckal_log!(
                             if let ChangeType::Added = change_type {
                                 "Adding"
                             } else {
                                 "Flushing"
                             },
-                            format!("{} v{}", package.name, package.version)
+                            format!("{} v{}", node.name, node.version)
                         );
 
-                        let is_third_party_pkg = is_third_party(package);
+                        let is_third_party_pkg = is_third_party(node);
 
                         // Vendor package sources
                         let vendor_dir = if !is_third_party_pkg {
-                            package.manifest_path.parent().unwrap().to_owned()
+                            node.manifest_path.parent().unwrap().to_owned()
                         } else {
-                            vendor_package(package)
+                            vendor_package(node)
                         };
 
                         // Generate BUCK rules
@@ -59,7 +57,7 @@ impl BuckalChange {
                         let workspace_manifest_path = ctx.workspace_root.join("Cargo.toml");
                         if ctx.workspace_inherit
                             && !workspace_emitted
-                            && package.manifest_path == workspace_manifest_path
+                            && node.manifest_path == workspace_manifest_path
                         {
                             buck_rules.push(Rule::ExportFile(emit_export_file()));
                             workspace_emitted = true;
@@ -73,7 +71,7 @@ impl BuckalChange {
                         let mut buck_content = gen_buck_content(&buck_rules);
                         if !is_third_party_pkg {
                             buck_content =
-                                windows::patch_root_windows_rustc_flags(buck_content, ctx, package);
+                                windows::patch_root_windows_rustc_flags(buck_content, ctx, node);
                         }
                         buck_content = cross::patch_rust_test_target_compatible_with(buck_content);
                         std::fs::write(&buck_path, buck_content)
@@ -130,22 +128,9 @@ impl BuckalChange {
     }
 }
 
-/// Check if a package is a third-party dependency
-pub(super) fn is_third_party(package: &Package) -> bool {
-    if package.source.is_some() {
-        true
-    } else {
-        let package_id_spec =
-            PackageIdSpec::parse(&package.id.repr).unwrap_or_exit_ctx("failed to parse package ID");
-        let buck2_root = get_buck2_root().unwrap_or_exit_ctx("failed to get Buck2 root");
-        if let Some(url) = package_id_spec.url() {
-            let url_path = get_url_path(url);
-            url_path.strip_prefix(buck2_root.as_str()).is_none()
-        } else {
-            // If there's no URL, we treat it as a first-party package
-            false
-        }
-    }
+/// Check if a node represents a third-party dependency
+pub(super) fn is_third_party(node: &BuckalNode) -> bool {
+    matches!(node.kind, NodeKind::ThirdParty)
 }
 
 /// Merge existing BUCK rules with new ones, preserving manual changes in specified fields.
@@ -160,5 +145,120 @@ fn merge_rules(buck_path: &Utf8Path, buck_rules: &mut [Rule], ctx: &BuckalContex
     } else {
         std::fs::File::create(buck_path)
             .unwrap_or_exit_ctx(format!("Failed to create {}", buck_path));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::{BTreeMap, HashMap};
+
+    use cargo_metadata::{PackageId, camino::Utf8PathBuf};
+    use daggy::Dag;
+
+    use crate::{
+        cache::{BuckalChange, ChangeType},
+        config::RepoConfig,
+        context::BuckalContext,
+        resolve::{BuckalNode, BuckalResolve, BuckalTarget, NodeKind},
+    };
+
+    use cargo_metadata::Edition;
+    use cargo_metadata::TargetKind;
+
+    fn mock_target(name: &str, kind: TargetKind, src_path: Utf8PathBuf) -> BuckalTarget {
+        BuckalTarget {
+            name: name.to_string(),
+            kind: vec![kind],
+            src_path,
+            doctest: true,
+            test: true,
+        }
+    }
+
+    fn mock_first_party_node(
+        name: &str,
+        manifest_path: Utf8PathBuf,
+        targets: Vec<BuckalTarget>,
+    ) -> BuckalNode {
+        BuckalNode {
+            package_id: PackageId {
+                repr: format!("path+file://{name}#0.1.0"),
+            },
+            name: name.to_string(),
+            version: "0.1.0".to_string(),
+            features: vec![],
+            kind: NodeKind::FirstParty {
+                relative_path: "".to_string(),
+            },
+            edition: Edition::E2021,
+            manifest_path,
+            targets,
+            source: None,
+            links: None,
+            checksum: None,
+        }
+    }
+
+    #[test]
+    fn test_apply_generates_root_buck_file() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let tmp_path =
+            Utf8PathBuf::try_from(tmp.path().to_path_buf()).expect("temp dir is not valid UTF-8");
+
+        let manifest_path = tmp_path.join("Cargo.toml");
+        std::fs::write(
+            &manifest_path,
+            "[package]\nname = \"myroot\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo.toml");
+
+        // Create a src/lib.rs so the target src_path exists
+        let src_dir = tmp_path.join("src");
+        std::fs::create_dir_all(&src_dir).expect("create src dir");
+        std::fs::write(src_dir.join("lib.rs"), "").expect("write lib.rs");
+
+        let lib_target = mock_target("myroot", TargetKind::Lib, tmp_path.join("src/lib.rs"));
+        let node = mock_first_party_node("myroot", manifest_path, vec![lib_target]);
+        let package_id = node.package_id.clone();
+
+        // Build a BuckalResolve with the node in the graph
+        let mut dag = Dag::new();
+        let idx = dag.add_node(node);
+        let mut index_map = HashMap::new();
+        index_map.insert(package_id.clone(), idx);
+        let resolve = BuckalResolve { dag, index_map };
+
+        // BuckalChange with Added for our root package
+        let mut changes = BTreeMap::new();
+        changes.insert(package_id.clone(), ChangeType::Added);
+        let change = BuckalChange { changes };
+
+        // BuckalContext with root set to our package (this is the key scenario)
+        let ctx = BuckalContext {
+            root: Some(package_id),
+            resolve,
+            workspace_root: tmp_path.clone(),
+            workspace_inherit: false,
+            no_merge: false,
+            repo_config: RepoConfig::default(),
+        };
+
+        change.apply(&ctx);
+
+        let buck_path = tmp_path.join("BUCK");
+        assert!(
+            buck_path.exists(),
+            "BUCK file should be generated for root package"
+        );
+
+        let content = std::fs::read_to_string(&buck_path).expect("read BUCK file");
+        assert!(
+            content.contains("rust_library"),
+            "BUCK file should contain a rust_library rule, got:\n{content}"
+        );
+        assert!(
+            content.contains("load("),
+            "BUCK file should contain load statements, got:\n{content}"
+        );
     }
 }
