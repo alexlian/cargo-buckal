@@ -1,7 +1,9 @@
 pub mod add;
 pub mod autoremove;
 pub mod build;
+pub mod check;
 pub mod clean;
+pub mod clippy;
 pub mod init;
 pub mod login;
 pub mod logout;
@@ -9,5 +11,6 @@ pub mod migrate;
 pub mod new;
 pub mod push;
 pub mod remove;
+pub mod run;
 pub mod test;
 pub mod update;

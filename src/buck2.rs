@@ -67,6 +67,11 @@ impl Buck2Command {
         Self::new().subcommand("build")
     }
 
+    /// Create a run command
+    pub fn run() -> Self {
+        Self::new().subcommand("run")
+    }
+
     /// Create a test command
     pub fn test() -> Self {
         Self::new().subcommand("test")

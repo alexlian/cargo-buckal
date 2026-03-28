@@ -38,8 +38,14 @@ pub enum BuckalSubCommands {
     /// Compile the current package
     Build(crate::commands::build::BuildArgs),
 
+    /// Type-check the current package without producing binaries
+    Check(crate::commands::check::CheckArgs),
+
     /// Remove generated artifacts
     Clean(crate::commands::clean::CleanArgs),
+
+    /// Run clippy lints on the current package
+    Clippy(crate::commands::clippy::ClippyArgs),
 
     /// Create a new package in an existing directory
     Init(crate::commands::init::InitArgs),
@@ -62,6 +68,9 @@ pub enum BuckalSubCommands {
     /// Remove dependencies from a manifest file
     Remove(crate::commands::remove::RemoveArgs),
 
+    /// Run a binary target
+    Run(crate::commands::run::RunArgs),
+
     /// Execute unit and integration tests of a package
     Test(Box<crate::commands::test::TestArgs>),
 
@@ -82,7 +91,9 @@ impl Cli {
                         BuckalSubCommands::Add(args) => commands::add::execute(args),
                         BuckalSubCommands::Autoremove(args) => commands::autoremove::execute(args),
                         BuckalSubCommands::Build(args) => commands::build::execute(args),
+                        BuckalSubCommands::Check(args) => commands::check::execute(args),
                         BuckalSubCommands::Clean(args) => commands::clean::execute(args),
+                        BuckalSubCommands::Clippy(args) => commands::clippy::execute(args),
                         BuckalSubCommands::Init(args) => commands::init::execute(args),
                         BuckalSubCommands::Login(args) => commands::login::execute(args),
                         BuckalSubCommands::Logout(args) => commands::logout::execute(args),
@@ -90,6 +101,7 @@ impl Cli {
                         BuckalSubCommands::New(args) => commands::new::execute(args),
                         BuckalSubCommands::Push(args) => commands::push::execute(args),
                         BuckalSubCommands::Remove(args) => commands::remove::execute(args),
+                        BuckalSubCommands::Run(args) => commands::run::execute(args),
                         BuckalSubCommands::Test(args) => commands::test::execute(args),
                         BuckalSubCommands::Update(args) => commands::update::execute(args),
                     },
