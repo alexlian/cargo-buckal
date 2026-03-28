@@ -348,11 +348,16 @@ pub(super) fn emit_cargo_manifest(node: &BuckalNode, ctx: &BuckalContext) -> Car
     }
 }
 
-/// Emit `export_file` rule for the workspace Cargo.toml
+/// Emit `export_file` rule for the workspace Cargo.toml.
+///
+/// Uses `mode = "reference"` so that downstream rules (e.g. `cargo_manifest`)
+/// see the real on-disk path instead of a buck-out copy. This is required for
+/// manifest_parse to resolve relative readme/license-file paths correctly.
 pub(super) fn emit_export_file() -> ExportFile {
     ExportFile {
         name: "workspace".to_owned(),
         src: "Cargo.toml".to_string(),
+        mode: Some("reference".to_owned()),
         visibility: Set::from(["PUBLIC".to_owned()]),
     }
 }
