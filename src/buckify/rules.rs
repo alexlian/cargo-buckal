@@ -43,15 +43,10 @@ pub fn buckify_dep_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
             buck_rules.push(Rule::HttpArchive(http_archive));
         }
         SourceKind::Path => {
-            buckal_error!(
-                "Local path ({}) is not supported for third-party packages.",
-                package_id_spec.url().unwrap().path()
-            );
-            buckal_note!(
-                "Please consider importing `{}` with registry or git source instead, or if it's a local package, move it to the workspace and it will be treated as a root package.",
-                node.name
-            );
-            std::process::exit(1);
+            // External path dependency — sources are copied into the vendor directory
+            // during vendor_package(). Use a filegroup to reference them.
+            let filegroup = emit_filegroup();
+            buck_rules.push(Rule::FileGroup(filegroup));
         }
         SourceKind::Git(_) => {
             let git_fetch = emit_git_fetch(node);
@@ -243,7 +238,64 @@ pub fn vendor_package(node: &BuckalNode) -> Utf8PathBuf {
         std::fs::create_dir_all(&vendor_dir).expect("Failed to create target directory");
     }
 
+    // For path dependencies, copy the source tree into the vendor directory.
+    // Registry and git sources are fetched at build time by buck2 rules.
+    let package_id_spec =
+        PackageIdSpec::parse(&node.package_id.repr).unwrap_or_exit_ctx("failed to parse package ID");
+    if let Some(SourceKind::Path) = package_id_spec.kind() {
+        let source_dir = node.manifest_path.parent().unwrap();
+        copy_path_dep_sources(source_dir.as_std_path(), vendor_dir.as_std_path());
+    }
+
     vendor_dir
+}
+
+/// Directories that should never be vendored from path dependencies.
+/// These are build artifacts, VCS metadata, and tool state that are not
+/// part of the crate's source and would bloat the vendor directory.
+const VENDOR_EXCLUDE_DIRS: &[&str] = &[
+    "target",
+    ".git",
+    "buck-out",
+    ".buckal",
+    "node_modules",
+    ".hg",
+];
+
+/// Copy source files from a path dependency into the vendor directory.
+///
+/// Copies the full source tree except for well-known build artifact and VCS
+/// directories (see [`VENDOR_EXCLUDE_DIRS`]). This ensures that build scripts
+/// can access all source files they need (e.g. `.proto` files, migrations,
+/// templates) via `CARGO_MANIFEST_DIR`.
+fn copy_path_dep_sources(source: &std::path::Path, dest: &std::path::Path) {
+    use fs_extra::dir::CopyOptions;
+
+    for entry in std::fs::read_dir(source).expect("Failed to read path dependency directory") {
+        let entry = entry.expect("Failed to read directory entry");
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        if VENDOR_EXCLUDE_DIRS.iter().any(|exc| *exc == &*name_str) {
+            continue;
+        }
+
+        let dest_path = dest.join(&name);
+        let file_type = entry.file_type().expect("Failed to get file type");
+
+        if file_type.is_file() {
+            std::fs::copy(entry.path(), &dest_path)
+                .expect("Failed to copy file from path dependency");
+        } else if file_type.is_dir() {
+            if dest_path.exists() {
+                std::fs::remove_dir_all(&dest_path)
+                    .expect("Failed to clean existing directory in vendor");
+            }
+            let opts = CopyOptions::new().overwrite(true);
+            fs_extra::dir::copy(entry.path(), dest, &opts)
+                .expect("Failed to copy directory from path dependency");
+        }
+    }
 }
 
 /// Generate the content of the BUCK file based on the given rules, including conditional load statements for used rule types.
