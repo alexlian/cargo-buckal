@@ -137,14 +137,24 @@ pub(super) fn is_third_party(node: &BuckalNode) -> bool {
     matches!(node.kind, NodeKind::ThirdParty)
 }
 
-/// Merge existing BUCK rules with new ones, preserving manual changes in specified fields.
-fn merge_rules(buck_path: &Utf8Path, buck_rules: &mut [Rule], ctx: &BuckalContext) {
+/// Merge existing BUCK rules with new ones, preserving manual changes in specified fields
+/// and retaining manually-added rules that don't conflict with generated ones.
+fn merge_rules(buck_path: &Utf8Path, buck_rules: &mut Vec<Rule>, ctx: &BuckalContext) {
     if buck_path.exists() {
         // Skip merging manual changes if `--no-merge` is set
         if !ctx.no_merge && !ctx.repo_config.patch_fields.is_empty() {
             let existing_rules = parse_buck_file(buck_path)
                 .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
             patch_buck_rules(&existing_rules, buck_rules, &ctx.repo_config.patch_fields);
+
+            // Preserve manually-added rules that don't match any generated rule
+            let generated_keys: std::collections::BTreeSet<String> =
+                buck_rules.iter().map(|r| r.map_key()).collect();
+            for rule in existing_rules.values() {
+                if !generated_keys.contains(&rule.map_key()) {
+                    buck_rules.push(rule.clone());
+                }
+            }
         }
     } else {
         std::fs::File::create(buck_path)
