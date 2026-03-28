@@ -32,6 +32,11 @@ impl Rule {
             _ => None,
         }
     }
+
+    /// Returns a key that uniquely identifies this rule by type and name.
+    pub fn map_key(&self) -> String {
+        rule_map_key(self)
+    }
 }
 
 pub trait RustRule {
