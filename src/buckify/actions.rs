@@ -147,6 +147,14 @@ fn merge_rules(buck_path: &Utf8Path, buck_rules: &mut Vec<Rule>, ctx: &BuckalCon
             let generated_keys: std::collections::BTreeSet<String> =
                 buck_rules.iter().map(|r| r.map_key()).collect();
             for rule in existing_rules.values() {
+                // `load(...)` statements are synthesized fresh by `gen_buck_content`
+                // from the rule types present; a parsed-from-disk one is part of
+                // that header, not a manually-added rule. Carrying it through would
+                // re-emit it at the tail of the file (duplicate loads on every
+                // `--merge` run — harmless to buck2, but noisy churn).
+                if matches!(rule, Rule::Load(_)) {
+                    continue;
+                }
                 if !generated_keys.contains(&rule.map_key()) {
                     buck_rules.push(rule.clone());
                 }
