@@ -181,17 +181,25 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
 
             let mut rust_test = emit_rust_test(node, test_target, &manifest_dir, &buckal_name, ctx);
 
-            let package_name = node.name.replace("-", "_");
-            let mut lib_alias = false;
-            if bin_targets.iter().any(|b| b.name == package_name) {
-                lib_alias = true;
+            // Cargo sets `CARGO_BIN_EXE_<name>` for *every* binary target in the
+            // package when building an integration test (or bench), where `<name>`
+            // is the binary's name verbatim. Mirror that so `env!`/`option_env!`
+            // calls like `env!("CARGO_BIN_EXE_my-helper")` resolve under Buck2.
+            // The `$(location ...)` arg-macro also pulls each binary into the test
+            // rule's dependency graph, so the helper is built before the test runs.
+            for bin_target in &bin_targets {
                 rust_test.env_mut().insert(
-                    format!("CARGO_BIN_EXE_{}", package_name),
-                    format!("$(location :{})", package_name),
+                    format!("CARGO_BIN_EXE_{}", bin_target.name),
+                    format!("$(location :{})", bin_target.name),
                 );
             }
+
+            // An integration test implicitly links the package's own library.
+            // When a binary shares the library's name, the library rule was
+            // renamed to `<name>-lib` (see the bin/lib emission above).
+            let package_name = node.name.replace("-", "_");
             if lib_targets.iter().any(|l| l.name == package_name) {
-                if lib_alias {
+                if bin_targets.iter().any(|b| b.name == package_name) {
                     rust_test
                         .deps_mut()
                         .insert(format!(":{}-lib", package_name));
@@ -488,5 +496,96 @@ mod tests {
         assert!(test_rule.is_some());
         let test_rule = test_rule.unwrap();
         assert!(test_rule.deps.contains(":foo-lib"));
+        // The `foo` binary is also exposed to the integration test.
+        assert_eq!(
+            test_rule.env.get("CARGO_BIN_EXE_foo").map(String::as_str),
+            Some("$(location :foo)")
+        );
+    }
+
+    #[test]
+    fn test_buckify_root_node_test_env_exposes_all_package_bins() {
+        // A package binary whose name differs from the package name must still
+        // be exposed to integration tests via `CARGO_BIN_EXE_<bin>` — that was
+        // the gap that broke `env!("CARGO_BIN_EXE_<helper>")`-style tests.
+        let lib = mock_target("mypkg", TargetKind::Lib);
+        let bin_same = mock_target("mypkg", TargetKind::Bin); // shares the lib name
+        let bin_helper = mock_target("helper-tool", TargetKind::Bin); // name != package
+        let test = mock_target("it", TargetKind::Test);
+
+        let node = mock_node("mypkg", vec![lib, bin_same, bin_helper, test]);
+
+        let ctx = BuckalContext {
+            root: None,
+            resolve: empty_resolve(),
+            repo_config: RepoConfig {
+                ignore_tests: false,
+                ..RepoConfig::default()
+            },
+            workspace_root: Utf8PathBuf::from("/tmp"),
+            workspace_inherit: false,
+            no_merge: false,
+        };
+
+        let rules = buckify_root_node(&node, &ctx);
+        let test_rule = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustTest(t) if t.name == "it" => Some(t),
+                _ => None,
+            })
+            .expect("expected a rust_test rule named `it`");
+
+        assert_eq!(
+            test_rule.env.get("CARGO_BIN_EXE_mypkg").map(String::as_str),
+            Some("$(location :mypkg)")
+        );
+        assert_eq!(
+            test_rule
+                .env
+                .get("CARGO_BIN_EXE_helper-tool")
+                .map(String::as_str),
+            Some("$(location :helper-tool)")
+        );
+        // A bin shares the lib name, so the library rule was renamed to `<name>-lib`.
+        assert!(test_rule.deps.contains(":mypkg-lib"));
+    }
+
+    #[test]
+    fn test_buckify_root_node_test_env_empty_without_bins() {
+        let lib = mock_target("solo", TargetKind::Lib);
+        let test = mock_target("it", TargetKind::Test);
+        let node = mock_node("solo", vec![lib, test]);
+
+        let ctx = BuckalContext {
+            root: None,
+            resolve: empty_resolve(),
+            repo_config: RepoConfig {
+                ignore_tests: false,
+                ..RepoConfig::default()
+            },
+            workspace_root: Utf8PathBuf::from("/tmp"),
+            workspace_inherit: false,
+            no_merge: false,
+        };
+
+        let rules = buckify_root_node(&node, &ctx);
+        let test_rule = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustTest(t) if t.name == "it" => Some(t),
+                _ => None,
+            })
+            .expect("expected a rust_test rule named `it`");
+
+        assert!(
+            !test_rule
+                .env
+                .keys()
+                .any(|k| k.starts_with("CARGO_BIN_EXE_")),
+            "no bin targets should mean no CARGO_BIN_EXE_* entries, got {:?}",
+            test_rule.env
+        );
+        assert!(test_rule.deps.contains(":solo"));
     }
 }
