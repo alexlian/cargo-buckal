@@ -3,11 +3,12 @@ use clap::Parser;
 use crate::{
     buck2::Buck2Command,
     buckal_error, buckal_note,
-    filter::{FilterCaller, TargetFilter, get_available_targets},
+    filter::{FilterCaller, TargetFilter, get_available_targets_in},
     utils::{
         UnwrapOrExit, ensure_prerequisites, get_buck2_root, get_target, is_inside_buck2_project,
         platform_exists, validate_target_triple,
     },
+    workspace,
 };
 
 #[derive(Parser, Debug)]
@@ -19,6 +20,18 @@ pub struct CheckArgs {
     /// Use verbose output (`-vv` very verbose output)
     #[arg(short, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// Package(s) to check (defaults to the package in the current directory)
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Vec<String>,
+
+    /// Check all packages in the workspace
+    #[arg(long)]
+    pub workspace: bool,
+
+    /// Exclude packages from the check (requires `--workspace`)
+    #[arg(long, value_name = "SPEC")]
+    pub exclude: Vec<String>,
 
     /// Check the package's library
     #[arg(long)]
@@ -104,7 +117,9 @@ pub fn execute(args: &CheckArgs) {
     )
     .unwrap_or_exit();
 
-    let available_targets = get_available_targets(&relative).unwrap_or_exit();
+    let scope = workspace::resolve_scope(&args.package, args.workspace, &args.exclude, &relative)
+        .unwrap_or_exit();
+    let available_targets = get_available_targets_in(&scope).unwrap_or_exit();
 
     let target_platforms = if let Some(triple) = &args.target {
         match validate_target_triple(triple) {
@@ -261,6 +276,30 @@ mod tests {
                     assert!(check_args.lib);
                     assert!(check_args.bins);
                 }
+                other => panic!("expected check subcommand, got {other:?}"),
+            },
+        }
+    }
+
+    #[test]
+    fn cli_check_accepts_package_and_workspace() {
+        let cli = Cli::try_parse_from(["cargo", "buckal", "check", "-p", "mm_core"])
+            .expect("failed to parse check -p");
+        match cli.command {
+            Commands::Buckal(args) => match args.subcommands {
+                Some(BuckalSubCommands::Check(check_args)) => {
+                    assert_eq!(check_args.package, vec!["mm_core"]);
+                    assert!(!check_args.workspace);
+                }
+                other => panic!("expected check subcommand, got {other:?}"),
+            },
+        }
+
+        let cli = Cli::try_parse_from(["cargo", "buckal", "check", "--workspace"])
+            .expect("failed to parse check --workspace");
+        match cli.command {
+            Commands::Buckal(args) => match args.subcommands {
+                Some(BuckalSubCommands::Check(check_args)) => assert!(check_args.workspace),
                 other => panic!("expected check subcommand, got {other:?}"),
             },
         }

@@ -3,11 +3,12 @@ use clap::Parser;
 use crate::{
     buck2::Buck2Command,
     buckal_error, buckal_note,
-    filter::{FilterCaller, TargetFilter, get_available_targets},
+    filter::{FilterCaller, TargetFilter, get_available_targets_in},
     utils::{
         UnwrapOrExit, ensure_prerequisites, get_buck2_root, get_target, is_inside_buck2_project,
         platform_exists, validate_target_triple,
     },
+    workspace,
 };
 
 #[derive(Parser, Debug)]
@@ -15,6 +16,18 @@ pub struct ClippyArgs {
     /// Use verbose output (`-vv` very verbose output)
     #[arg(short, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// Package(s) to lint (defaults to the package in the current directory)
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Vec<String>,
+
+    /// Lint all packages in the workspace
+    #[arg(long)]
+    pub workspace: bool,
+
+    /// Exclude packages from linting (requires `--workspace`)
+    #[arg(long, value_name = "SPEC")]
+    pub exclude: Vec<String>,
 
     /// Check only this package's library
     #[arg(long)]
@@ -104,7 +117,9 @@ pub fn execute(args: &ClippyArgs) {
     )
     .unwrap_or_exit();
 
-    let available_targets = get_available_targets(&relative).unwrap_or_exit();
+    let scope = workspace::resolve_scope(&args.package, args.workspace, &args.exclude, &relative)
+        .unwrap_or_exit();
+    let available_targets = get_available_targets_in(&scope).unwrap_or_exit();
 
     let target_platforms = if let Some(triple) = &args.target {
         match validate_target_triple(triple) {
@@ -241,6 +256,21 @@ mod tests {
             Commands::Buckal(args) => match args.subcommands {
                 Some(BuckalSubCommands::Clippy(clippy_args)) => {
                     assert!(clippy_args.all_targets);
+                }
+                other => panic!("expected clippy subcommand, got {other:?}"),
+            },
+        }
+    }
+
+    #[test]
+    fn cli_clippy_accepts_package_and_workspace() {
+        let cli = Cli::try_parse_from(["cargo", "buckal", "clippy", "-p", "mm_ai", "--workspace"])
+            .expect("failed to parse clippy -p --workspace");
+        match cli.command {
+            Commands::Buckal(args) => match args.subcommands {
+                Some(BuckalSubCommands::Clippy(clippy_args)) => {
+                    assert_eq!(clippy_args.package, vec!["mm_ai"]);
+                    assert!(clippy_args.workspace);
                 }
                 other => panic!("expected clippy subcommand, got {other:?}"),
             },

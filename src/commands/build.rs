@@ -3,11 +3,12 @@ use clap::Parser;
 use crate::{
     buck2::Buck2Command,
     buckal_error, buckal_note,
-    filter::{FilterCaller, TargetFilter, get_available_targets},
+    filter::{FilterCaller, TargetFilter, get_available_targets_in},
     utils::{
         UnwrapOrExit, ensure_prerequisites, get_buck2_root, get_target, is_inside_buck2_project,
         platform_exists, validate_target_triple,
     },
+    workspace,
 };
 
 #[derive(Parser, Debug)]
@@ -19,6 +20,18 @@ pub struct BuildArgs {
     /// Use verbose output (`-vv` very verbose output)
     #[arg(short, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// Package(s) to build (defaults to the package in the current directory)
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Vec<String>,
+
+    /// Build all packages in the workspace
+    #[arg(long)]
+    pub workspace: bool,
+
+    /// Exclude packages from the build (requires `--workspace`)
+    #[arg(long, value_name = "SPEC")]
+    pub exclude: Vec<String>,
 
     /// Build only the package’s library
     #[arg(long)]
@@ -109,7 +122,9 @@ pub fn execute(args: &BuildArgs) {
     )
     .unwrap_or_exit();
 
-    let available_targets = get_available_targets(&relative).unwrap_or_exit();
+    let scope = workspace::resolve_scope(&args.package, args.workspace, &args.exclude, &relative)
+        .unwrap_or_exit();
+    let available_targets = get_available_targets_in(&scope).unwrap_or_exit();
 
     let target_platforms = if let Some(triple) = &args.target {
         // Validate the target triple and get the corresponding platform
@@ -160,5 +175,52 @@ pub fn execute(args: &BuildArgs) {
     match buck2_cmd.status() {
         Ok(status) if status.success() => {}
         _ => std::process::exit(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::{BuckalSubCommands, Cli, Commands};
+
+    use clap::Parser;
+
+    fn build_args(argv: &[&str]) -> crate::commands::build::BuildArgs {
+        let cli = Cli::try_parse_from(argv).expect("failed to parse build args");
+        match cli.command {
+            Commands::Buckal(args) => match args.subcommands {
+                Some(BuckalSubCommands::Build(build_args)) => build_args,
+                other => panic!("expected build subcommand, got {other:?}"),
+            },
+        }
+    }
+
+    #[test]
+    fn cli_build_accepts_package_short_and_long() {
+        let args = build_args(&["cargo", "buckal", "build", "-p", "mm_core"]);
+        assert_eq!(args.package, vec!["mm_core"]);
+        assert!(!args.workspace);
+
+        let args = build_args(&["cargo", "buckal", "build", "--package", "mm_core"]);
+        assert_eq!(args.package, vec!["mm_core"]);
+    }
+
+    #[test]
+    fn cli_build_accepts_repeated_package() {
+        let args = build_args(&["cargo", "buckal", "build", "-p", "a", "-p", "b"]);
+        assert_eq!(args.package, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn cli_build_accepts_workspace_and_exclude() {
+        let args = build_args(&[
+            "cargo",
+            "buckal",
+            "build",
+            "--workspace",
+            "--exclude",
+            "mm_ai",
+        ]);
+        assert!(args.workspace);
+        assert_eq!(args.exclude, vec!["mm_ai"]);
     }
 }

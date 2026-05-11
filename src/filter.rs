@@ -314,18 +314,30 @@ impl BuckTargetEntry {
 
 /// Get available targets from Buck2 under the specified package, and filter out non-Rust rules and third-party rules.
 pub fn get_available_targets(package: &str) -> anyhow::Result<Vec<BuckTargetEntry>> {
-    let target_pattern = if package.is_empty() {
-        "//...".into()
+    get_available_targets_in(&[package.to_string()])
+}
+
+/// Like [`get_available_targets`], but queries several packages in a single
+/// `buck2 targets` invocation. Each entry is a Buck-relative package path
+/// (forward slashes); an empty entry means "the whole project" (`//...`).
+pub fn get_available_targets_in(packages: &[String]) -> anyhow::Result<Vec<BuckTargetEntry>> {
+    if packages.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let patterns: Vec<String> = if packages.iter().any(|p| p.is_empty()) {
+        // A `//...` query subsumes every package-scoped pattern.
+        vec!["//...".to_string()]
     } else {
-        format!("//{package}/...")
+        packages.iter().map(|p| format!("//{p}/...")).collect()
     };
 
-    match Buck2Command::targets()
-        .arg(&target_pattern)
-        .arg("--output-basic-attributes")
-        .arg("--json")
-        .output()
-    {
+    let mut cmd = Buck2Command::targets();
+    for pattern in &patterns {
+        cmd = cmd.arg(pattern);
+    }
+
+    match cmd.arg("--output-basic-attributes").arg("--json").output() {
         Ok(output) => {
             if output.status.success() {
                 let targets = serde_json::from_slice::<Vec<BuckTargetEntry>>(&output.stdout)?

@@ -8,6 +8,7 @@ use crate::{
         UnwrapOrExit, ensure_prerequisites, get_buck2_root, get_target, is_inside_buck2_project,
         platform_exists, validate_target_triple,
     },
+    workspace,
 };
 
 #[derive(Parser, Debug)]
@@ -19,6 +20,10 @@ pub struct RunArgs {
     /// Use verbose output (`-vv` very verbose output)
     #[arg(short, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    /// Package whose binary to run (defaults to the package in the current directory)
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Option<String>,
 
     /// Run the specified binary
     #[arg(long, value_name = "NAME")]
@@ -60,6 +65,11 @@ pub fn execute(args: &RunArgs) {
 
     // Normalize path separators for Buck2 (always use forward slashes)
     relative = relative.replace('\\', "/");
+
+    // `-p <pkg>` overrides the cwd-implied package with the named workspace member.
+    if let Some(pkg) = &args.package {
+        relative = workspace::resolve_member_path(pkg).unwrap_or_exit();
+    }
 
     // Resolve the single target to run
     let target = resolve_run_target(args, &relative);
@@ -200,6 +210,20 @@ mod tests {
             Commands::Buckal(args) => match args.subcommands {
                 Some(BuckalSubCommands::Run(run_args)) => {
                     assert_eq!(run_args.bin.as_deref(), Some("myapp"));
+                }
+                other => panic!("expected run subcommand, got {other:?}"),
+            },
+        }
+    }
+
+    #[test]
+    fn cli_run_with_package() {
+        let cli = Cli::try_parse_from(["cargo", "buckal", "run", "-p", "mm_cli"])
+            .expect("failed to parse run -p args");
+        match cli.command {
+            Commands::Buckal(args) => match args.subcommands {
+                Some(BuckalSubCommands::Run(run_args)) => {
+                    assert_eq!(run_args.package.as_deref(), Some("mm_cli"));
                 }
                 other => panic!("expected run subcommand, got {other:?}"),
             },

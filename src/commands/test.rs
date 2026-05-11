@@ -3,15 +3,28 @@ use clap::Parser;
 use crate::{
     buck2::Buck2Command,
     buckal_error, buckal_note,
-    filter::{FilterCaller, TargetFilter, get_available_targets},
+    filter::{FilterCaller, TargetFilter, get_available_targets_in},
     utils::{
         UnwrapOrExit, ensure_prerequisites, get_buck2_root, get_target, is_inside_buck2_project,
         platform_exists, validate_target_triple,
     },
+    workspace,
 };
 
 #[derive(Parser, Debug)]
 pub struct TestArgs {
+    /// Package(s) to test (defaults to the package in the current directory)
+    #[arg(short = 'p', long = "package", value_name = "SPEC")]
+    pub package: Vec<String>,
+
+    /// Test all packages in the workspace
+    #[arg(long)]
+    pub workspace: bool,
+
+    /// Exclude packages from the test run (requires `--workspace`)
+    #[arg(long, value_name = "SPEC")]
+    pub exclude: Vec<String>,
+
     /// Test all targets
     #[arg(long)]
     pub all_targets: bool,
@@ -135,7 +148,9 @@ pub fn execute(args: &TestArgs) {
         target_filter = TargetFilter::all_test_targets();
     }
 
-    let available_targets = get_available_targets(&relative).unwrap_or_exit();
+    let scope = workspace::resolve_scope(&args.package, args.workspace, &args.exclude, &relative)
+        .unwrap_or_exit();
+    let available_targets = get_available_targets_in(&scope).unwrap_or_exit();
 
     let mut buck2_cmd = if args.no_run {
         Buck2Command::build().verbosity(args.verbose)
@@ -213,5 +228,62 @@ pub fn execute(args: &TestArgs) {
     match buck2_cmd.status() {
         Ok(status) if status.success() => {}
         _ => std::process::exit(1),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::cli::{BuckalSubCommands, Cli, Commands};
+
+    use clap::Parser;
+
+    fn test_args(argv: &[&str]) -> crate::commands::test::TestArgs {
+        let cli = Cli::try_parse_from(argv).expect("failed to parse test args");
+        match cli.command {
+            Commands::Buckal(args) => match args.subcommands {
+                Some(BuckalSubCommands::Test(test_args)) => *test_args,
+                other => panic!("expected test subcommand, got {other:?}"),
+            },
+        }
+    }
+
+    #[test]
+    fn cli_test_accepts_package() {
+        let args = test_args(&["cargo", "buckal", "test", "-p", "mm_e2e"]);
+        assert_eq!(args.package, vec!["mm_e2e"]);
+        assert!(!args.workspace);
+
+        let args = test_args(&["cargo", "buckal", "test", "--package", "mm_e2e"]);
+        assert_eq!(args.package, vec!["mm_e2e"]);
+    }
+
+    #[test]
+    fn cli_test_accepts_workspace_and_exclude() {
+        let args = test_args(&[
+            "cargo",
+            "buckal",
+            "test",
+            "--workspace",
+            "--exclude",
+            "mm_e2e",
+        ]);
+        assert!(args.workspace);
+        assert_eq!(args.exclude, vec!["mm_e2e"]);
+    }
+
+    #[test]
+    fn cli_test_workspace_with_passthrough_and_filter() {
+        let args = test_args(&[
+            "cargo",
+            "buckal",
+            "test",
+            "--workspace",
+            "my_filter",
+            "--",
+            "--nocapture",
+        ]);
+        assert!(args.workspace);
+        assert_eq!(args.test_name.as_deref(), Some("my_filter"));
+        assert_eq!(args.args, vec!["--nocapture"]);
     }
 }

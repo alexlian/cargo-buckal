@@ -13,6 +13,7 @@ pub mod platform;
 pub mod registry;
 pub mod resolve;
 pub mod utils;
+pub mod workspace;
 
 use std::sync::OnceLock;
 
