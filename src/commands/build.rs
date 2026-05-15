@@ -80,6 +80,11 @@ pub struct BuildArgs {
     /// Build for the target platform (passed to buck2 `--target-platforms`)
     #[arg(long, value_name = "PLATFORM", conflicts_with = "target")]
     pub target_platforms: Option<String>,
+
+    /// Forward a raw argument to `buck2` (repeatable). Applied after buckal's
+    /// computed flags so user values win on conflict.
+    #[arg(long = "buck2-arg", value_name = "ARG", allow_hyphen_values = true)]
+    pub buck2_arg: Vec<String>,
 }
 
 pub fn execute(args: &BuildArgs) {
@@ -153,6 +158,9 @@ pub fn execute(args: &BuildArgs) {
     if let Some(platform) = &target_platforms {
         buck2_cmd = buck2_cmd.arg("--target-platforms").arg(platform);
     }
+    for raw in &args.buck2_arg {
+        buck2_cmd = buck2_cmd.arg(raw);
+    }
 
     let mut target_specified = false;
 
@@ -208,6 +216,19 @@ mod tests {
     fn cli_build_accepts_repeated_package() {
         let args = build_args(&["cargo", "buckal", "build", "-p", "a", "-p", "b"]);
         assert_eq!(args.package, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn cli_build_accepts_repeated_buck2_arg() {
+        let args = build_args(&[
+            "cargo",
+            "buckal",
+            "build",
+            "--buck2-arg=--show-json-output",
+            "--buck2-arg",
+            "--show-output",
+        ]);
+        assert_eq!(args.buck2_arg, vec!["--show-json-output", "--show-output"]);
     }
 
     #[test]

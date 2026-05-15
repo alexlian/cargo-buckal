@@ -97,6 +97,11 @@ pub struct TestArgs {
     #[arg(value_name = "TESTNAME")]
     pub test_name: Option<String>,
 
+    /// Forward a raw argument to `buck2` (repeatable). Applied after buckal's
+    /// computed flags so user values win on conflict.
+    #[arg(long = "buck2-arg", value_name = "ARG", allow_hyphen_values = true)]
+    pub buck2_arg: Vec<String>,
+
     /// Arguments for the test executor
     #[arg(last = true)]
     pub args: Vec<String>,
@@ -193,6 +198,10 @@ pub fn execute(args: &TestArgs) {
         buck2_cmd = buck2_cmd.arg("--keep-going");
     }
 
+    for raw in &args.buck2_arg {
+        buck2_cmd = buck2_cmd.arg(raw);
+    }
+
     let mut target_specified = false;
 
     // Add test targets to the command based on the filter
@@ -269,6 +278,22 @@ mod tests {
         ]);
         assert!(args.workspace);
         assert_eq!(args.exclude, vec!["mm_e2e"]);
+    }
+
+    #[test]
+    fn cli_test_buck2_arg_with_testname_and_executor_passthrough() {
+        let args = test_args(&[
+            "cargo",
+            "buckal",
+            "test",
+            "--buck2-arg=--show-json-output",
+            "my_filter",
+            "--",
+            "--nocapture",
+        ]);
+        assert_eq!(args.buck2_arg, vec!["--show-json-output"]);
+        assert_eq!(args.test_name.as_deref(), Some("my_filter"));
+        assert_eq!(args.args, vec!["--nocapture"]);
     }
 
     #[test]

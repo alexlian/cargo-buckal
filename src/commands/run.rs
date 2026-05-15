@@ -41,6 +41,11 @@ pub struct RunArgs {
     #[arg(long, value_name = "PLATFORM", conflicts_with = "target")]
     pub target_platforms: Option<String>,
 
+    /// Forward a raw argument to `buck2` (repeatable). Applied after buckal's
+    /// computed flags so user values win on conflict.
+    #[arg(long = "buck2-arg", value_name = "ARG", allow_hyphen_values = true)]
+    pub buck2_arg: Vec<String>,
+
     /// Arguments to pass to the binary
     #[arg(last = true)]
     pub args: Vec<String>,
@@ -99,6 +104,9 @@ pub fn execute(args: &RunArgs) {
     }
     if let Some(platform) = &target_platforms {
         buck2_cmd = buck2_cmd.arg("--target-platforms").arg(platform);
+    }
+    for raw in &args.buck2_arg {
+        buck2_cmd = buck2_cmd.arg(raw);
     }
 
     // Pass through arguments to the binary
@@ -279,6 +287,29 @@ mod tests {
             "//platforms:x86_64-unknown-linux-gnu",
         ]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn cli_run_buck2_arg_with_binary_passthrough() {
+        let cli = Cli::try_parse_from([
+            "cargo",
+            "buckal",
+            "run",
+            "--buck2-arg=--show-output",
+            "--",
+            "--flag",
+            "value",
+        ])
+        .expect("failed to parse run --buck2-arg + --");
+        match cli.command {
+            Commands::Buckal(args) => match args.subcommands {
+                Some(BuckalSubCommands::Run(run_args)) => {
+                    assert_eq!(run_args.buck2_arg, vec!["--show-output"]);
+                    assert_eq!(run_args.args, vec!["--flag", "value"]);
+                }
+                other => panic!("expected run subcommand, got {other:?}"),
+            },
+        }
     }
 
     #[test]
