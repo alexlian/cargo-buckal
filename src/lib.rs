@@ -23,7 +23,7 @@ pub const RUST_GIT_ROOT: &str = "third-party/rust/git";
 pub const RUST_LOCAL_ROOT: &str = "third-party/rust/local";
 pub const BUCKAL_BUNDLES_REPO: &str = "alexlian/buckal-bundles";
 // fallback commit hash used when fetching the latest from BUCKAL_BUNDLES_REPO fails
-pub const DEFAULT_BUNDLE_HASH: &str = "1697cc5eef8977b7073e357c17c0fb63fe4b361d";
+pub const DEFAULT_BUNDLE_HASH: &str = "221b613c564f7a1b33b4588d33d3a92779eb2d8d";
 
 pub fn build_version() -> &'static str {
     static VERSION_STRING: OnceLock<String> = OnceLock::new();

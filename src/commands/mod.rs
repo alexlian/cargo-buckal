@@ -9,6 +9,7 @@ pub mod login;
 pub mod logout;
 pub mod migrate;
 pub mod new;
+pub mod patch;
 pub mod push;
 pub mod remove;
 pub mod run;

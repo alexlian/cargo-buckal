@@ -30,7 +30,7 @@ Common commands:
 
 - `cargo buckal init|new`: Create a new package or a Buck2 project in the directory.
 - `cargo buckal migrate`: Migrate an existing Cargo project to Buck2 (generate/update BUCK files).
-- `cargo buckal add|remove|update`: Manage dependencies, applying the changes to both `Cargo.toml` and `BUCK` files.
+- `cargo buckal add|remove|update|patch`: Manage dependencies, applying the changes to both `Cargo.toml`/`buckal.toml` and `BUCK` files.
 - `cargo buckal build`: Build the current package with Buck2.
 - `cargo buckal test`: Compile and execute unit and integration tests with Buck2.
 - `cargo buckal clean`: Remove `buck-out` directory.
@@ -47,15 +47,19 @@ This is equivalent to running `cargo buckal init --repo` at `<repo_root>` follow
 
 ## Supported platforms
 
-Platform-aware dependency mapping and bundled sample platforms currently target these Rust tier-1 host triples:
+Platform-aware dependency mapping and bundled sample platforms target these triples:
 
-- Linux: `x86_64-unknown-linux-gnu`
-- Windows: `x86_64-pc-windows-msvc`
-- macOS: `aarch64-apple-darwin`
+| | x86_64 | arm64 |
+|---|---|---|
+| Linux | `x86_64-unknown-linux-gnu` | `aarch64-unknown-linux-gnu` |
+| Windows | `x86_64-pc-windows-msvc` | `aarch64-pc-windows-msvc` |
+| macOS | `x86_64-apple-darwin` | `aarch64-apple-darwin` |
 
 ## Multi-platform builds
 
-Buckal preserves platform-conditional Cargo dependencies by emitting `os_deps`/`os_named_deps` and canonical OS constraints, so the same generated BUCK files can be built for different target platforms without regenerating on each host.
+Buckal preserves platform-conditional Cargo dependencies by emitting `os_deps`/`os_named_deps`, so the same generated BUCK files can be built for different target platforms without regenerating on each host.
+
+Keys are OS names (`linux`) or OS/CPU pairs (`linux-arm64`) — the latter for dependencies conditional on *(arch, os)*, such as `cpufeatures`' `libc` under `cfg(all(target_arch = "aarch64", target_os = "linux"))`. See [docs/multi-platform.md](docs/multi-platform.md); note that your platform definitions must declare a CPU constraint.
 
 See https://buck2hub.com/docs/multi-platform.
 
@@ -72,6 +76,16 @@ buck2_binary = "/path/to/your/buck2"
 ```
 
 If no configuration file exists, cargo-buckal will use `buck2` (searches your PATH).
+
+To redirect dependency labels from one resolved version to another, add entries to the repo-local
+`buckal.toml`:
+
+```toml
+[patch.version]
+pyo3 = { from = "0.26.0", to = "0.27.2" }
+```
+
+You can also write these entries with `cargo buckal patch pyo3@0.27.2`.
 
 ## Pre-commit Hooks
 

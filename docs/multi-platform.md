@@ -4,26 +4,37 @@
 
 ## What gets generated
 
-- `os_deps`: OS-scoped dependencies (e.g., a Windows-only dep lands under `os_deps["windows"]`).
+- `os_deps`: platform-scoped dependencies (e.g., a Windows-only dep lands under `os_deps["windows"]`).
 - `os_named_deps`: same as `os_deps`, but for renamed dependencies.
 - `compatible_with`: applied to a small allowlist of known OS-only crates to prevent Buck2 from building them on the wrong OS.
 
-The generated rules use canonical Buck prelude OS constraint labels: `prelude//os/constraints:{linux,macos,windows}`.
+## Platform keys
+
+An `os_deps` key is either an **OS name** (`linux`) or an **OS/CPU pair** (`linux-arm64`). The pair form exists because plenty of crates are conditional on *(arch, os)* rather than on the OS alone — `cpufeatures` needs `libc` only under `cfg(all(target_arch = "aarch64", target_os = "linux"))`, which an OS-keyed map cannot express at all.
+
+cargo-buckal emits the bare OS key whenever a dependency applies to **every** supported CPU of that OS (which is the case for almost every crate — `cfg(unix)`, `cfg(windows)` and friends), and a refined key only when the CPUs disagree.
+
+The keys lower to Buck constraint labels: `prelude//os/constraints:{linux,macos,windows}` for the bare form, and `buckal//platforms:{linux,macos,windows}-{x86_64,arm64}` for the refined form. Both can match the same platform; Buck2 resolves that by **refinement**, preferring the `config_setting` whose constraints are a strict superset — so the refined branch wins wherever the platform declares a CPU.
+
+> **Your platforms must declare a CPU constraint.** A platform that sets only an OS constraint cannot match a refined key, so a crate whose deps are arch-split will fall through to the default branch and lose them. The platforms generated under `//platforms:*` all declare one, as does `prelude//platforms:default` (it derives both OS and CPU from the host).
 
 ## Supported platforms
 
-Platform-aware dependency mapping and bundled sample platforms currently target these Rust tier-1
-host triples:
+Platform-aware dependency mapping and bundled sample platforms target these triples:
 
-- Linux: `x86_64-unknown-linux-gnu`
-- Windows: `x86_64-pc-windows-msvc`
-- macOS: `aarch64-apple-darwin`
+| | x86_64 | arm64 |
+|---|---|---|
+| Linux | `x86_64-unknown-linux-gnu` | `aarch64-unknown-linux-gnu` |
+| Windows | `x86_64-pc-windows-msvc` | `aarch64-pc-windows-msvc` |
+| macOS | `x86_64-apple-darwin` | `aarch64-apple-darwin` |
+
+Every OS is listed at every CPU deliberately. A hole in this table is not merely a loss of precision: a `cfg` expression naming the missing pair matches *no* triple, so the dependency is dropped from the generated BUCK file entirely and the build fails on that platform with an unresolved import.
 
 ## How platform matching works
 
-Cargo encodes target-specific dependencies in `cargo metadata` as platform predicates (for example, `cfg(target_os = "windows")`). During `migrate`, cargo-buckal maps those predicates to a set of OS keys (`linux`/`macos`/`windows`) by evaluating them against cached `rustc --print=cfg --target <triple>` snapshots for Rust Tier-1 host targets.
+Cargo encodes target-specific dependencies in `cargo metadata` as platform predicates (for example, `cfg(target_os = "windows")`). During `migrate`, cargo-buckal evaluates each predicate against cached `rustc --print=cfg --target <triple>` snapshots for every supported triple, producing the set of (OS, CPU) platforms it matches — and then reduces that set to the platform keys above.
 
-If a predicate can’t be mapped to `linux`/`macos`/`windows`, cargo-buckal treats the dependency as unconditional by default (to preserve build success).
+If a predicate can’t be mapped to any supported platform, cargo-buckal treats the dependency as unconditional by default (to preserve build success).
 
 ## Using it
 
