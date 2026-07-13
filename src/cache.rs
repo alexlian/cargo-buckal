@@ -22,11 +22,17 @@ use crate::resolve::BuckalResolve;
 ///            absolute workspace path verbatim (always so on Windows, where
 ///            canonicalization used to no-op), so diffing an older cache against a
 ///            v5-format snapshot would report spurious add/remove entries.
+/// Version 6: Arch-aware conditional dependencies. Fingerprints are computed over
+///            `BuckalNode` (package metadata), *not* over the emitted rule, so a
+///            change to how cfg expressions lower into `os_deps` does not move any
+///            fingerprint. Without this bump every affected BUCK file would be
+///            considered up to date and would silently keep its pre-arch-aware
+///            (in some cases: missing) dependencies.
 ///
 /// Migration strategy:
 /// - If found < expected (stale cache from older Buckal): ignore the old cache and rebuild.
 /// - If found > expected (cache from newer Buckal): exit immediately and prompt the user to upgrade.
-const CACHE_VERSION: u32 = 5;
+const CACHE_VERSION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Fingerprint([u8; 32]);
@@ -35,6 +41,11 @@ impl Fingerprint {
     pub fn new(bytes: [u8; 32]) -> Self {
         Self(bytes)
     }
+
+    /// A fingerprint no freshly computed one will match (barring a 2^-256
+    /// coincidence). Used by [`BuckalCache::invalidated`] to force a `Changed`
+    /// verdict for every package across a codegen-only cache bump.
+    const INVALID: Self = Self([0u8; 32]);
 }
 
 impl Serialize for Fingerprint {
@@ -201,26 +212,51 @@ impl BuckalCache {
     /// pending manifest edit: current metadata already equals the new state, so
     /// removed packages are simply absent from it.
     ///
-    /// The v4→v5 bump only changed how workspace path-source `PackageId`s are
-    /// keyed (verbatim absolute path → `($WORKSPACE)`), not the struct layout,
-    /// so we can preserve removal detection by re-keying the old fingerprints
-    /// with the fixed canonicalizer. Fingerprint *values* are kept as-is; any
-    /// that no longer match a freshly computed snapshot just re-emit as
-    /// `Changed`, which is safe (and on Windows actively rewrites BUCK files
-    /// that had embedded an absolute path).
+    /// Neither the v4→v5 nor the v5→v6 bump changed the struct layout, so both
+    /// are migratable — we keep the package set (which is what preserves
+    /// `Removed` detection) and fix up whatever the bump actually invalidated.
+    ///
+    /// - v4→v5 changed how workspace path-source `PackageId`s are *keyed*
+    ///   (verbatim absolute path → `($WORKSPACE)`), so the keys are re-canonicalized.
+    /// - v5→v6 changed *codegen* (arch-aware `os_deps`), which moves no fingerprint
+    ///   at all — fingerprints cover package metadata, not the emitted rule. So the
+    ///   fingerprint *values* are invalidated, forcing every BUCK file to be
+    ///   rewritten with the new lowering. See [`invalidated`](Self::invalidated).
     pub fn load_migrated(workspace_root: &Utf8PathBuf) -> Result<Self, Error> {
         let cache = Self::read_from_disk()?;
-        if cache.version == CACHE_VERSION {
-            return Ok(cache);
+        match cache.version {
+            v if v == CACHE_VERSION => Ok(cache),
+            // v4 predates ($WORKSPACE) key canonicalization, so re-key first —
+            // otherwise the ids wouldn't line up and workspace members would come
+            // out as Removed-and-Added rather than Changed.
+            4 => Ok(cache.rekeyed_v4_to_v5(workspace_root).invalidated()),
+            5 => Ok(cache.invalidated()),
+            _ => Err(anyhow!(
+                "Cache version is stale and not migratable (found {}, expected {})",
+                cache.version,
+                CACHE_VERSION
+            )),
         }
-        if cache.version == 4 {
-            return Ok(cache.rekeyed_v4_to_v5(workspace_root));
+    }
+
+    /// Keep the package set but force every fingerprint to miss, so [`diff`](Self::diff)
+    /// reports each surviving package as `Changed` — regenerating its BUCK file —
+    /// while still reporting dropped packages as `Removed`.
+    ///
+    /// This is what a codegen-only bump needs, and neither of the obvious
+    /// alternatives gives both halves: discarding the cache regenerates everything
+    /// but reports nothing as `Removed` (orphaned BUCK targets), while migrating it
+    /// verbatim preserves `Removed` but leaves every BUCK file looking up to date —
+    /// which for v6 means keeping the dependencies the old lowering *dropped*.
+    fn invalidated(self) -> Self {
+        Self {
+            fingerprints: self
+                .fingerprints
+                .into_keys()
+                .map(|id| (id, Fingerprint::INVALID))
+                .collect(),
+            version: CACHE_VERSION,
         }
-        Err(anyhow!(
-            "Cache version is stale and not migratable (found {}, expected {})",
-            cache.version,
-            CACHE_VERSION
-        ))
     }
 
     /// Re-key a v4 cache's fingerprints to the v5 `($WORKSPACE)` form. v5 only
@@ -426,14 +462,16 @@ mod tests {
     }
 
     #[test]
-    fn cache_version_bumped_for_workspace_pathfmt_change() {
-        // v5 is the bump for ($WORKSPACE) path-id canonicalization: pre-v5 caches
-        // store the absolute workspace path verbatim (always so on Windows), so an
-        // older cache must be rebuilt rather than diffed against the v5 form. Pinned
-        // exactly — not `>=` — so a future bump is a deliberate, visible event:
-        // when you bump CACHE_VERSION, update this assertion and add the rationale
-        // to the CACHE_VERSION doc comment.
-        assert_eq!(CACHE_VERSION, 5);
+    fn cache_version_is_pinned() {
+        // v6 is the bump for arch-aware conditional deps: fingerprints are computed
+        // over package metadata, not over the emitted rule, so without a bump every
+        // BUCK file whose `os_deps` lowering changed would be considered up to date
+        // and would keep its stale (sometimes missing) dependencies.
+        //
+        // Pinned exactly — not `>=` — so a future bump is a deliberate, visible
+        // event: when you bump CACHE_VERSION, update this assertion and add the
+        // rationale to the CACHE_VERSION doc comment.
+        assert_eq!(CACHE_VERSION, 6);
     }
 
     #[test]
@@ -481,12 +519,62 @@ mod tests {
             "removed workspace crate must be detected as Removed after v4->v5 migration; got {:?}",
             changes.changes
         );
-        // `foo` is unchanged (same fingerprint, key now aligned), so the
-        // migration introduces no spurious diff entry for it.
+        // `foo` is unchanged (same fingerprint, key now aligned), so *re-keying* on
+        // its own introduces no spurious diff entry. Note `load_migrated` then
+        // applies `invalidated()` on top, which deliberately does re-emit `foo` as
+        // Changed — see `migrating_v5_cache_regenerates_and_still_detects_removals`.
         let foo_resolved = foo_canon.resolve(&ws());
         assert!(
             !changes.changes.contains_key(&foo_resolved),
-            "unchanged crate must not appear in the diff after migration; got {:?}",
+            "unchanged crate must not appear in the diff after re-keying; got {:?}",
+            changes.changes
+        );
+    }
+
+    /// The v6 bump changes codegen, not package metadata, so no fingerprint moves.
+    /// The migration therefore has to do two things at once that pull in opposite
+    /// directions: force every surviving package to regenerate (or the arch-aware
+    /// `os_deps` lowering never reaches the BUCK files), while still reporting
+    /// dropped packages as Removed (or orphaned BUCK targets are left behind).
+    #[test]
+    fn migrating_v5_cache_regenerates_and_still_detects_removals() {
+        use super::{BuckalCache, ChangeType, Fingerprint};
+        use std::collections::BTreeMap;
+
+        let foo = PackageId {
+            repr: "registry+https://github.com/rust-lang/crates.io-index#foo@0.1.0".to_string(),
+        };
+        let bar = PackageId {
+            repr: "registry+https://github.com/rust-lang/crates.io-index#bar@0.1.0".to_string(),
+        };
+
+        let mut v5 = BTreeMap::new();
+        v5.insert(foo.clone(), Fingerprint::new([1u8; 32]));
+        v5.insert(bar.clone(), Fingerprint::new([2u8; 32]));
+        let v5_cache = BuckalCache {
+            fingerprints: v5,
+            version: 5,
+        };
+
+        // New resolve: `foo` survives with an identical fingerprint, `bar` is gone.
+        let mut v6 = BTreeMap::new();
+        v6.insert(foo.clone(), Fingerprint::new([1u8; 32]));
+        let new_cache = BuckalCache {
+            fingerprints: v6,
+            version: CACHE_VERSION,
+        };
+
+        let changes = new_cache.diff(&v5_cache.invalidated(), &ws());
+
+        assert!(
+            matches!(changes.changes.get(&foo), Some(ChangeType::Changed)),
+            "an unchanged package must still regenerate across the v6 codegen bump, \
+             or it keeps the deps the old lowering dropped; got {:?}",
+            changes.changes
+        );
+        assert!(
+            matches!(changes.changes.get(&bar), Some(ChangeType::Removed)),
+            "removal detection must survive the migration; got {:?}",
             changes.changes
         );
     }

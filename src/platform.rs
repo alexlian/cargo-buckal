@@ -37,12 +37,88 @@ impl Os {
     }
 }
 
-/// Tier1 host platforms used for cfg evaluation.
-/// Ref: https://doc.rust-lang.org/nightly/rustc/platform-support.html#tier-1-with-host-tools
-static SUPPORTED_TARGETS: &[(Os, &str)] = &[
-    (Os::Macos, "aarch64-apple-darwin"),
-    (Os::Windows, "x86_64-pc-windows-msvc"),
-    (Os::Linux, "x86_64-unknown-linux-gnu"),
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Arch {
+    X86_64,
+    Arm64,
+}
+
+impl Arch {
+    pub fn buck_label(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "prelude//cpu/constraints:x86_64",
+            Arch::Arm64 => "prelude//cpu/constraints:arm64",
+        }
+    }
+
+    /// The Buck2 CPU name, which is *not* the Rust arch name: Rust says
+    /// `aarch64`, Buck2 says `arm64`.
+    pub fn key(self) -> &'static str {
+        match self {
+            Arch::X86_64 => "x86_64",
+            Arch::Arm64 => "arm64",
+        }
+    }
+}
+
+/// A concrete (OS, CPU) target — the granularity Cargo's `cfg` expressions
+/// actually discriminate on, and therefore the granularity we have to evaluate
+/// at.
+///
+/// Collapsing this to [`Os`] alone is what made a dependency conditional on
+/// *(arch, os)* inexpressible, and — because Linux was represented only by an
+/// x86_64 triple — silently dropped `cfg(all(target_arch = "aarch64", target_os
+/// = "linux"))` dependencies altogether.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TargetPlatform {
+    pub os: Os,
+    pub arch: Arch,
+}
+
+impl TargetPlatform {
+    const fn new(os: Os, arch: Arch) -> Self {
+        Self { os, arch }
+    }
+
+    /// The refined `os_deps` key, e.g. `linux-arm64`.
+    pub fn key(self) -> String {
+        format!("{}-{}", self.os.key(), self.arch.key())
+    }
+}
+
+/// Platforms used for cfg evaluation: tier-1 hosts, plus the arm64 targets we
+/// build for (arm64 Linux cloud VMs, arm64 Windows).
+///
+/// Every OS must be listed at every CPU we support. A missing entry does not
+/// merely lose precision — the cfg expression matches nothing, and the
+/// dependency is dropped from the generated BUCK file.
+///
+/// Ref: https://doc.rust-lang.org/nightly/rustc/platform-support.html
+static SUPPORTED_TARGETS: &[(TargetPlatform, &str)] = &[
+    (
+        TargetPlatform::new(Os::Macos, Arch::Arm64),
+        "aarch64-apple-darwin",
+    ),
+    (
+        TargetPlatform::new(Os::Macos, Arch::X86_64),
+        "x86_64-apple-darwin",
+    ),
+    (
+        TargetPlatform::new(Os::Windows, Arch::X86_64),
+        "x86_64-pc-windows-msvc",
+    ),
+    (
+        TargetPlatform::new(Os::Windows, Arch::Arm64),
+        "aarch64-pc-windows-msvc",
+    ),
+    (
+        TargetPlatform::new(Os::Linux, Arch::X86_64),
+        "x86_64-unknown-linux-gnu",
+    ),
+    (
+        TargetPlatform::new(Os::Linux, Arch::Arm64),
+        "aarch64-unknown-linux-gnu",
+    ),
 ];
 
 /// Cache of `rustc --print=cfg --target <triple>` output for supported triples.
@@ -154,29 +230,45 @@ pub fn buck_labels(oses: &BTreeSet<Os>) -> BTreeSet<String> {
     oses.iter().map(|os| os.buck_label().to_string()).collect()
 }
 
-/// Returns the set of host OSes that satisfy a Cargo [`Platform`].
+/// The platforms we can actually evaluate: those in [`SUPPORTED_TARGETS`] whose
+/// triple `rustc` gave us cfg values for.
 ///
-/// This evaluates `platform` against a fixed set of Rust tier-1 host targets (`SUPPORTED_TARGETS`)
-/// by asking `rustc` for each target's cfg values (`rustc --print=cfg --target <triple>`) and then
-/// using [`Platform::matches`] to determine which target triples match.
+/// [`target_platforms`] can only ever return a subset of this, so callers that
+/// need to ask "does this dependency apply to *every* CPU of this OS?" must
+/// compare against this set rather than against [`SUPPORTED_TARGETS`] — else a
+/// triple `rustc` skipped would be read as a CPU the dependency doesn't cover.
+pub fn supported_platforms() -> BTreeSet<TargetPlatform> {
+    let cfgs = cfg_cache();
+    SUPPORTED_TARGETS
+        .iter()
+        .filter(|(_, triple)| cfgs.contains_key(triple))
+        .map(|(platform, _)| *platform)
+        .collect()
+}
+
+/// Returns the set of target platforms that satisfy a Cargo [`Platform`].
+///
+/// This evaluates `platform` against [`SUPPORTED_TARGETS`] by asking `rustc` for each target's cfg
+/// values (`rustc --print=cfg --target <triple>`) and then using [`Platform::matches`] to determine
+/// which target triples match.
 ///
 /// # Notes
 ///
 /// - The `rustc` cfg output is cached for the lifetime of the process.
-/// - Results depend on which targets are installed in the active toolchain. If `rustc` cannot
-///   produce cfg output for a triple (for example, the target is not installed), that triple is
-///   skipped, which can cause this function to return an empty set even when the `Platform` would
-///   match on a machine with more targets available.
+/// - Results depend on which targets `rustc` knows. If it cannot produce cfg output for a triple,
+///   that triple is skipped, which can cause this function to return an empty set even when the
+///   `Platform` would match on a machine with more targets available. (`--print=cfg` only needs the
+///   target *spec*, not an installed std, so in practice this only bites on an unknown triple.)
 /// - Named platforms (`Platform::Name`) only match if they exactly equal one of the supported
-///   tier-1 target triples.
-pub fn oses_from_platform(platform: &Platform) -> BTreeSet<Os> {
+///   target triples.
+pub fn target_platforms(platform: &Platform) -> BTreeSet<TargetPlatform> {
     let cfgs = cfg_cache();
     SUPPORTED_TARGETS
         .iter()
-        .filter_map(|(os, triple)| {
+        .filter_map(|(target, triple)| {
             cfgs.get(triple).and_then(|cfgs| {
                 if platform.matches(triple, cfgs) {
-                    Some(*os)
+                    Some(*target)
                 } else {
                     None
                 }
@@ -439,10 +531,67 @@ mod tests {
         // Test that supported targets are defined and non-empty
         assert!(!SUPPORTED_TARGETS.is_empty());
 
-        // Test that each supported target has a valid OS and triple
-        for (os, triple) in SUPPORTED_TARGETS {
-            assert!(matches!(os, Os::Windows | Os::Macos | Os::Linux));
+        // Test that each supported target has a valid OS/arch and triple
+        for (target, triple) in SUPPORTED_TARGETS {
+            assert!(matches!(target.os, Os::Windows | Os::Macos | Os::Linux));
+            assert!(matches!(target.arch, Arch::X86_64 | Arch::Arm64));
             assert!(!triple.is_empty());
         }
+    }
+
+    /// Every OS must be listed at every arch. A hole here is not a loss of
+    /// precision — a cfg expression naming the missing (arch, os) pair matches no
+    /// triple at all, and the dependency is silently dropped from the generated
+    /// BUCK file. That hole (Linux at x86_64 only) is exactly what made an
+    /// aarch64-linux build fail on `cpufeatures` with an unresolved `libc` import.
+    #[test]
+    fn test_supported_targets_cover_every_os_arch_pair() {
+        let listed: BTreeSet<TargetPlatform> = SUPPORTED_TARGETS
+            .iter()
+            .map(|(target, _)| *target)
+            .collect();
+
+        for os in [Os::Windows, Os::Macos, Os::Linux] {
+            for arch in [Arch::X86_64, Arch::Arm64] {
+                assert!(
+                    listed.contains(&TargetPlatform { os, arch }),
+                    "SUPPORTED_TARGETS is missing {}-{}; cfg expressions naming that \
+                     pair would match nothing and their deps would be dropped",
+                    os.key(),
+                    arch.key()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_supported_targets_have_unique_triples() {
+        let triples: BTreeSet<&str> = SUPPORTED_TARGETS.iter().map(|(_, t)| *t).collect();
+        assert_eq!(
+            triples.len(),
+            SUPPORTED_TARGETS.len(),
+            "each (os, arch) pair must map to a distinct triple"
+        );
+    }
+
+    #[test]
+    fn test_arch_labels_and_keys() {
+        // Buck2's CPU name, not Rust's: `aarch64` in a target triple is `arm64` here.
+        assert_eq!(Arch::Arm64.key(), "arm64");
+        assert_eq!(Arch::X86_64.key(), "x86_64");
+        assert_eq!(Arch::Arm64.buck_label(), "prelude//cpu/constraints:arm64");
+        assert_eq!(Arch::X86_64.buck_label(), "prelude//cpu/constraints:x86_64");
+    }
+
+    #[test]
+    fn test_target_platform_key() {
+        assert_eq!(
+            TargetPlatform::new(Os::Linux, Arch::Arm64).key(),
+            "linux-arm64"
+        );
+        assert_eq!(
+            TargetPlatform::new(Os::Windows, Arch::X86_64).key(),
+            "windows-x86_64"
+        );
     }
 }

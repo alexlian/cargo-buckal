@@ -7,7 +7,9 @@ use crate::{
     buckal_note, buckal_warn,
     buckify::actions::is_third_party,
     context::BuckalContext,
-    platform::{Os, oses_from_platform, platform_is_target_only},
+    platform::{
+        Arch, Os, TargetPlatform, platform_is_target_only, supported_platforms, target_platforms,
+    },
     resolve::{BuckalDep, BuckalNode, BuckalTarget, is_lib_like},
     utils::{get_buck2_root, get_vendor_path_relative},
 };
@@ -126,6 +128,42 @@ fn resolve_dep_label(
     }
 }
 
+/// The `os_deps` / `os_named_deps` keys under which a dependency matching
+/// `matched` must be recorded.
+///
+/// A key is either an OS name (`linux`) or an OS/CPU pair (`linux-arm64`). Per
+/// OS, if the dependency applies to *every* supported CPU of that OS we emit the
+/// bare OS key — which is what every non-arch-conditional dependency does, so
+/// their generated output is unchanged. Otherwise we emit a refined key per
+/// matching CPU, which Buck2's select refinement prefers over the bare OS key.
+///
+/// `supported` is passed in rather than read from [`supported_platforms`] so this
+/// stays a pure function (and so the tests don't need `rustc`).
+fn platform_keys(matched: &Set<TargetPlatform>, supported: &Set<TargetPlatform>) -> Set<String> {
+    let mut keys = Set::new();
+    for os in matched.iter().map(|p| p.os).collect::<Set<Os>>() {
+        let matched_archs: Set<Arch> = matched
+            .iter()
+            .filter(|p| p.os == os)
+            .map(|p| p.arch)
+            .collect();
+        let supported_archs: Set<Arch> = supported
+            .iter()
+            .filter(|p| p.os == os)
+            .map(|p| p.arch)
+            .collect();
+
+        if matched_archs == supported_archs {
+            keys.insert(os.key().to_owned());
+        } else {
+            for arch in matched_archs {
+                keys.insert(TargetPlatform { os, arch }.key());
+            }
+        }
+    }
+    keys
+}
+
 /// Insert a dependency label into `rust_rule` in the appropriate attribute.
 ///
 /// `target` is the Buck label we want the rule to depend on. If `alias` is `Some`, the
@@ -137,24 +175,25 @@ fn resolve_dep_label(
 /// `platforms` controls whether the dependency is unconditional or platform-specific:
 /// - `None` means the dependency applies on all platforms and is inserted into `deps` or
 ///   `named_deps`.
-/// - `Some(set)` means the dependency is conditional and is inserted into `os_deps` or
-///   `os_named_deps` for each OS in `set`.
+/// - `Some(keys)` means the dependency is conditional and is inserted into `os_deps` or
+///   `os_named_deps` under each platform key in `keys` (see [`platform_keys`]).
 ///
 /// # Conflict handling
 ///
 /// - For unconditional named dependencies (`named_deps`), if an alias is encountered more than
 ///   once with different targets, we emit a warning and keep the first value.
 /// - For platform-specific named dependencies (`os_named_deps`), an alias may map to only one
-///   target per OS. Conflicting targets for the same `(alias, os)` are treated as an error.
+///   target per platform key. Conflicting targets for the same `(alias, key)` are treated as an
+///   error.
 fn insert_dep(
     rust_rule: &mut dyn RustRule,
     target: &str,
     alias: Option<&str>,
-    platforms: Option<&Set<Os>>,
+    platforms: Option<&Set<String>>,
 ) -> Result<()> {
     if let Some(platforms) = platforms {
-        for os in platforms {
-            let os_key = os.key().to_owned();
+        for os_key in platforms {
+            let os_key = os_key.to_owned();
             if let Some(alias) = alias {
                 let entries = rust_rule
                     .os_named_deps_mut()
@@ -164,7 +203,7 @@ fn insert_dep(
                 if let Some(existing) = entries.get(&os_key) {
                     if existing != target {
                         bail!(
-                            "os_named_deps alias '{}' had conflicting targets for platform '{}': '{}' vs '{}'",
+                            "os_named_deps alias '{}' had conflicting targets for platform key '{}': '{}' vs '{}'",
                             alias,
                             os_key,
                             existing,
@@ -211,9 +250,11 @@ pub(super) fn set_deps(
     kind: CargoTargetKind,
     ctx: &BuckalContext,
 ) -> Result<()> {
+    let supported = supported_platforms();
+
     for (dep, dep_node) in ctx.resolve.deps_of(&node.package_id) {
         let mut unconditional = false;
-        let mut platforms = Set::<Os>::new();
+        let mut matched = Set::<TargetPlatform>::new();
         let mut has_unsupported_platform = false;
 
         for dk in dep
@@ -224,8 +265,8 @@ pub(super) fn set_deps(
             match &dk.target {
                 None => unconditional = true,
                 Some(platform) => {
-                    let oses = oses_from_platform(platform);
-                    if oses.is_empty() {
+                    let targets = target_platforms(platform);
+                    if targets.is_empty() {
                         if platform_is_target_only(platform) {
                             has_unsupported_platform = true;
                             continue;
@@ -233,12 +274,12 @@ pub(super) fn set_deps(
                         unconditional = true;
                         continue;
                     }
-                    platforms.extend(oses);
+                    matched.extend(targets);
                 }
             }
         }
 
-        if !unconditional && platforms.is_empty() {
+        if !unconditional && matched.is_empty() {
             if has_unsupported_platform {
                 buckal_note!(
                     "Dependency '{}' (package '{}') targets only unsupported platforms and will be omitted.",
@@ -259,10 +300,105 @@ pub(super) fn set_deps(
         if unconditional {
             insert_dep(rust_rule, &target_label, alias.as_deref(), None)?;
         } else {
-            insert_dep(rust_rule, &target_label, alias.as_deref(), Some(&platforms))?;
+            let keys = platform_keys(&matched, &supported);
+            insert_dep(rust_rule, &target_label, alias.as_deref(), Some(&keys))?;
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod platform_key_tests {
+    use super::*;
+    use crate::platform::{Arch, Os, TargetPlatform};
+
+    fn p(os: Os, arch: Arch) -> TargetPlatform {
+        TargetPlatform { os, arch }
+    }
+
+    fn all_supported() -> Set<TargetPlatform> {
+        [Os::Windows, Os::Macos, Os::Linux]
+            .into_iter()
+            .flat_map(|os| {
+                [Arch::X86_64, Arch::Arm64]
+                    .into_iter()
+                    .map(move |a| p(os, a))
+            })
+            .collect()
+    }
+
+    fn keys(matched: &[TargetPlatform]) -> Set<String> {
+        platform_keys(&matched.iter().copied().collect(), &all_supported())
+    }
+
+    /// The common case, and the one that keeps regeneration diffs small: a dep that
+    /// applies to every CPU of an OS (`cfg(unix)`, `cfg(windows)`) still emits the
+    /// bare OS key, exactly as before arch-awareness.
+    #[test]
+    fn covers_every_arch_of_an_os_emits_the_bare_os_key() {
+        let unix = keys(&[
+            p(Os::Linux, Arch::X86_64),
+            p(Os::Linux, Arch::Arm64),
+            p(Os::Macos, Arch::X86_64),
+            p(Os::Macos, Arch::Arm64),
+        ]);
+        assert_eq!(unix, Set::from(["linux".to_string(), "macos".to_string()]));
+    }
+
+    /// `cpufeatures`: `libc` under `cfg(all(target_arch = "aarch64", target_os =
+    /// "linux"))`. The whole point — an OS key cannot express this, and emitting
+    /// `linux` would wrongly add libc on x86_64.
+    #[test]
+    fn one_arch_of_an_os_emits_the_refined_key() {
+        assert_eq!(
+            keys(&[p(Os::Linux, Arch::Arm64)]),
+            Set::from(["linux-arm64".to_string()])
+        );
+    }
+
+    /// A dep can be bare on one OS and refined on another simultaneously —
+    /// `cfg(target_arch = "x86_64")` covers both Windows CPUs only if both are
+    /// supported, but covers just one CPU on Linux and macOS.
+    #[test]
+    fn mixed_oses_key_independently() {
+        let x86_only = keys(&[
+            p(Os::Linux, Arch::X86_64),
+            p(Os::Macos, Arch::X86_64),
+            p(Os::Windows, Arch::X86_64),
+        ]);
+        assert_eq!(
+            x86_only,
+            Set::from([
+                "linux-x86_64".to_string(),
+                "macos-x86_64".to_string(),
+                "windows-x86_64".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn no_match_emits_no_keys() {
+        assert!(keys(&[]).is_empty());
+    }
+
+    /// `supported` is what "covers every arch" is measured against — not the full
+    /// table. If `rustc` could not evaluate the arm64 Linux triple, then Linux is
+    /// effectively x86_64-only and an x86_64 dep covers it, so the bare key is
+    /// correct. Keying it `linux-x86_64` would be wrong: nothing would then match a
+    /// plain-`linux` platform.
+    #[test]
+    fn coverage_is_relative_to_the_evaluable_platforms() {
+        let supported = Set::from([
+            p(Os::Linux, Arch::X86_64),
+            p(Os::Macos, Arch::X86_64),
+            p(Os::Macos, Arch::Arm64),
+        ]);
+        let matched = Set::from([p(Os::Linux, Arch::X86_64)]);
+        assert_eq!(
+            platform_keys(&matched, &supported),
+            Set::from(["linux".to_string()])
+        );
+    }
 }
 
 #[cfg(test)]

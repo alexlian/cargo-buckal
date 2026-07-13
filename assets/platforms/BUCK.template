@@ -35,6 +35,16 @@ platform(
     visibility = ["PUBLIC"],
 )
 
+platform(
+    name = "aarch64-unknown-linux-gnu",
+    constraint_values = [
+        "prelude//os/constraints:linux",
+        "prelude//cpu/constraints:arm64",
+        "prelude//abi/constraints:gnu",
+    ],
+    visibility = ["PUBLIC"],
+)
+
 config_setting(
     name = "cross",
     values = {

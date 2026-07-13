@@ -112,10 +112,10 @@ Commands are registered in `src/cli.rs` via the `BuckalSubCommands` enum and dis
 
 ### Platform Handling
 
-- `Os` enum: `Windows`, `Macos`, `Linux`
-- Tier-1 triples: `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc`, `aarch64-apple-darwin`
+- `Os` enum: `Windows`, `Macos`, `Linux`; `Arch` enum: `X86_64`, `Arm64`; `TargetPlatform` is the (OS, CPU) pair
+- Supported triples: every OS at every CPU (6 total). A hole in that table silently *drops* deps whose `cfg` names the missing pair — it is not just a loss of precision
 - Platform predicates evaluated via `rustc --print=cfg --target <triple>`
-- Conditional deps mapped to `os_deps`/`os_named_deps` in BUCK files
+- Conditional deps mapped to `os_deps`/`os_named_deps` in BUCK files, keyed by OS (`linux`) or OS/CPU pair (`linux-arm64`); the pair form is desugared by the buckal-bundles `wrapper.bzl`, so a key-format change spans both repos
 
 ## Code Conventions
 

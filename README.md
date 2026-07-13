@@ -47,15 +47,19 @@ This is equivalent to running `cargo buckal init --repo` at `<repo_root>` follow
 
 ## Supported platforms
 
-Platform-aware dependency mapping and bundled sample platforms currently target these Rust tier-1 host triples:
+Platform-aware dependency mapping and bundled sample platforms target these triples:
 
-- Linux: `x86_64-unknown-linux-gnu`
-- Windows: `x86_64-pc-windows-msvc`
-- macOS: `aarch64-apple-darwin`
+| | x86_64 | arm64 |
+|---|---|---|
+| Linux | `x86_64-unknown-linux-gnu` | `aarch64-unknown-linux-gnu` |
+| Windows | `x86_64-pc-windows-msvc` | `aarch64-pc-windows-msvc` |
+| macOS | `x86_64-apple-darwin` | `aarch64-apple-darwin` |
 
 ## Multi-platform builds
 
-Buckal preserves platform-conditional Cargo dependencies by emitting `os_deps`/`os_named_deps` and canonical OS constraints, so the same generated BUCK files can be built for different target platforms without regenerating on each host.
+Buckal preserves platform-conditional Cargo dependencies by emitting `os_deps`/`os_named_deps`, so the same generated BUCK files can be built for different target platforms without regenerating on each host.
+
+Keys are OS names (`linux`) or OS/CPU pairs (`linux-arm64`) — the latter for dependencies conditional on *(arch, os)*, such as `cpufeatures`' `libc` under `cfg(all(target_arch = "aarch64", target_os = "linux"))`. See [docs/multi-platform.md](docs/multi-platform.md); note that your platform definitions must declare a CPU constraint.
 
 See https://buck2hub.com/docs/multi-platform.
 

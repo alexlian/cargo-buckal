@@ -5,9 +5,25 @@ load("@prelude//toolchains:rust.bzl", "system_rust_toolchain")
 def system_demo_rust_toolchain():
     # Buck prelude only maps a small set of CPU constraints to Rust triples by
     # default. We provide an explicit mapping so `--target-platforms` works.
+    #
+    # The triple is selected on (os, cpu), not os alone: an os-only mapping hands
+    # rustc `x86_64-unknown-linux-gnu` on an aarch64 Linux host, which fails deep
+    # inside the build rather than at configuration time. `select()` keys are single
+    # labels, so each pair is a config_setting — they come from the buckal cell so
+    # this works without the repo defining its own.
+    #
+    # The bare-OS keys remain as a fallback for platforms that declare no CPU
+    # constraint; Buck2's select refinement prefers the (os, cpu) key wherever one
+    # matches.
     system_rust_toolchain(
         name = "rust",
         rustc_target_triple = select({
+            "buckal//platforms:linux-arm64": "aarch64-unknown-linux-gnu",
+            "buckal//platforms:linux-x86_64": "x86_64-unknown-linux-gnu",
+            "buckal//platforms:macos-arm64": "aarch64-apple-darwin",
+            "buckal//platforms:macos-x86_64": "x86_64-apple-darwin",
+            "buckal//platforms:windows-arm64": "aarch64-pc-windows-msvc",
+            "buckal//platforms:windows-x86_64": "x86_64-pc-windows-msvc",
             "prelude//os/constraints:linux": "x86_64-unknown-linux-gnu",
             "prelude//os/constraints:macos": "aarch64-apple-darwin",
             "prelude//os/constraints:windows": "x86_64-pc-windows-msvc",
