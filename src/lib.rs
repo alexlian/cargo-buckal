@@ -8,6 +8,7 @@ pub mod cli;
 pub mod commands;
 pub mod config;
 pub mod context;
+pub mod features;
 pub mod filter;
 pub mod platform;
 pub mod registry;
