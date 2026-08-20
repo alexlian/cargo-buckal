@@ -6,6 +6,7 @@ use cargo_util_schemas::{lockfile::TomlLockfile, manifest::TomlManifest};
 
 use crate::{
     config::RepoConfig,
+    features,
     resolve::{BuckalNode, BuckalResolve, NodeKind},
     utils::{UnwrapOrExit, get_buck2_root},
 };
@@ -25,7 +26,7 @@ pub struct BuckalContext {
 
 impl BuckalContext {
     pub fn new(manifest_path: Option<String>) -> Self {
-        let cargo_metadata = if let Some(manifest) = manifest_path {
+        let cargo_metadata = if let Some(manifest) = manifest_path.as_ref() {
             MetadataCommand::new()
                 .manifest_path(manifest)
                 .exec()
@@ -41,11 +42,45 @@ impl BuckalContext {
             .map(|p| (p.id.to_owned(), p))
             .collect::<HashMap<_, _>>();
         let resolve_meta = cargo_metadata.resolve.unwrap();
-        let nodes_map = resolve_meta
+        let mut nodes_map = resolve_meta
             .nodes
             .into_iter()
             .map(|n| (n.id.to_owned(), n))
             .collect::<HashMap<_, _>>();
+
+        // `node.features` as cargo reports it is the all-platform union, which
+        // is not what any single build compiles. Narrow it to what some
+        // supported platform actually enables. See `crate::features` for the
+        // mechanism and for why `--filter-platform` cannot do this.
+        let platform_features = features::platform_features(manifest_path.as_deref());
+        if !platform_features.is_empty() {
+            // Anything an unreachable package still depends on keeps the union:
+            // the emitter does not prune dep edges, so an unreachable package is
+            // still built, still against its original features.
+            let pinned = features::pinned_to_union(&nodes_map, &packages_map, &platform_features);
+            for (pkg_id, node) in nodes_map.iter_mut() {
+                if pinned.contains(pkg_id) {
+                    continue;
+                }
+                let Some(package) = packages_map.get(pkg_id) else {
+                    continue;
+                };
+                let key = (package.name.to_string(), package.version.to_string());
+                let Some(enabled) = platform_features.get(&key) else {
+                    // Cargo resolved a package for no supported platform at
+                    // all (a wasm-only crate, say). Its features are moot --
+                    // nothing compiles it -- so leave them rather than
+                    // inventing an empty set the emitter would have to
+                    // interpret.
+                    continue;
+                };
+                // Retain, never insert: this can only ever remove a feature no
+                // supported platform asked for. If cargo tree somehow knows a
+                // feature the metadata union lacks, the union still wins,
+                // which is the safe direction.
+                node.features.retain(|f| enabled.contains(&f.to_string()));
+            }
+        }
         let lock_path = cargo_metadata.workspace_root.join("Cargo.lock");
         let lock_content =
             std::fs::read_to_string(&lock_path).unwrap_or_exit_ctx("failed to read Cargo.lock");

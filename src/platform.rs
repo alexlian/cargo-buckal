@@ -226,6 +226,12 @@ fn cfg_cache() -> &'static HashMap<&'static str, Vec<Cfg>> {
     })
 }
 
+/// The triples of [`SUPPORTED_TARGETS`], for callers that ask *cargo* about
+/// each platform rather than evaluating a cfg expression themselves.
+pub fn supported_triples() -> impl Iterator<Item = &'static str> {
+    SUPPORTED_TARGETS.iter().map(|(_, triple)| *triple)
+}
+
 pub fn buck_labels(oses: &BTreeSet<Os>) -> BTreeSet<String> {
     oses.iter().map(|os| os.buck_label().to_string()).collect()
 }
