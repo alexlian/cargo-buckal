@@ -45,6 +45,33 @@ platform(
     visibility = ["PUBLIC"],
 )
 
+# The remaining two pairs of the (os, cpu) matrix `cargo buckal migrate`
+# evaluates `cfg(...)` predicates against. They are here because a missing
+# platform is not a loss of precision: a dep keyed to `macos-x86_64` or
+# `windows-arm64` lowers to a `select()` branch that no platform can match, so
+# the dep is dropped with no diagnostic. `//platforms/verify_deps.bxl:check`
+# fails on exactly that. See `SUPPORTED_TARGETS` in cargo-buckal's
+# `src/platform.rs` and `_PLATFORM_LABELS` in the buckal cell's `wrapper.bzl`.
+
+platform(
+    name = "x86_64-apple-darwin",
+    constraint_values = [
+        "prelude//os/constraints:macos",
+        "prelude//cpu/constraints:x86_64",
+    ],
+    visibility = ["PUBLIC"],
+)
+
+platform(
+    name = "aarch64-pc-windows-msvc",
+    constraint_values = [
+        "prelude//os/constraints:windows",
+        "prelude//cpu/constraints:arm64",
+        "prelude//abi/constraints:msvc",
+    ],
+    visibility = ["PUBLIC"],
+)
+
 config_setting(
     name = "cross",
     values = {

@@ -77,6 +77,7 @@ mod tests {
 
         let toolchains_buck = dest.path().join("toolchains").join("BUCK");
         let platforms_buck = dest.path().join("platforms").join("BUCK");
+        let verify_deps_bxl = dest.path().join("platforms").join("verify_deps.bxl");
         let demo_cxx = dest
             .path()
             .join("toolchains")
@@ -90,6 +91,7 @@ mod tests {
 
         assert!(toolchains_buck.is_file());
         assert!(platforms_buck.is_file());
+        assert!(verify_deps_bxl.is_file());
         assert!(demo_cxx.is_file());
         assert!(demo_rust.is_file());
 
