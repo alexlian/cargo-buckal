@@ -62,6 +62,20 @@ If a predicate can’t be mapped to any supported platform, cargo-buckal treats 
    cargo buckal migrate --fetch
    ```
 
+   Either form also brings `platforms/BUCK` up to date with the (os, cpu) matrix
+   this version of cargo-buckal lowers against, reporting each addition:
+
+   ```
+        Adding //platforms:x86_64-apple-darwin
+        Adding //platforms:aarch64-pc-windows-msvc
+   ```
+
+   This is not opt-in because the drift it repairs is silent — a repo generated
+   before a pair was added has no `platform()` for it, so every dependency keyed
+   to that pair sits in a `select()` branch nothing can match. The upgrade only
+   ever appends missing `platform()` targets: hand-written `config_setting`s,
+   comments, and edits to existing definitions are left untouched.
+
 2. Build with `cargo buckal build`:
 
    Without `--target-platforms`, builds for the host platform:
