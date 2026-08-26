@@ -248,8 +248,8 @@ pub fn vendor_package(node: &BuckalNode) -> Utf8PathBuf {
 
     // For path dependencies, copy the source tree into the vendor directory.
     // Registry and git sources are fetched at build time by buck2 rules.
-    let package_id_spec =
-        PackageIdSpec::parse(&node.package_id.repr).unwrap_or_exit_ctx("failed to parse package ID");
+    let package_id_spec = PackageIdSpec::parse(&node.package_id.repr)
+        .unwrap_or_exit_ctx("failed to parse package ID");
     if let Some(SourceKind::Path) = package_id_spec.kind() {
         let source_dir = node.manifest_path.parent().unwrap();
         copy_path_dep_sources(source_dir.as_std_path(), vendor_dir.as_std_path());

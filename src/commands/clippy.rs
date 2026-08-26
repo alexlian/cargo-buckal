@@ -2,11 +2,11 @@ use clap::Parser;
 
 use crate::{
     buck2::Buck2Command,
-    buckal_error, buckal_note,
-    filter::{FilterCaller, TargetFilter, get_available_targets_in},
+    buckal_error, buckal_note, diagnostics,
+    filter::{FilterCaller, TargetFilter, scan_targets_in},
     utils::{
         UnwrapOrExit, ensure_prerequisites, get_buck2_root, get_target, is_inside_buck2_project,
-        platform_exists, validate_target_triple,
+        validate_target_triple,
     },
     workspace,
 };
@@ -91,6 +91,24 @@ pub fn execute(args: &ClippyArgs) {
         std::process::exit(1);
     }
 
+    // These were accepted and dropped on the floor. Buck2 has no CLI knob for
+    // appending rustc flags to arbitrary targets — the prelude's Rust
+    // toolchain takes `rustc_flags` as a rule attribute, not from a
+    // `read_config` — so there is nothing to forward them to. Refusing is the
+    // honest failure: a silent no-op reads as "clippy ran with my lint levels"
+    // when it ran without them.
+    if !args.args.is_empty() {
+        buckal_error!(format!(
+            "`cargo buckal clippy -- {}` is not supported: Buck2 has no way to \
+             apply extra lint flags to a target at the command line",
+            args.args.join(" ")
+        ));
+        buckal_note!(
+            "set the lint levels in `Cargo.toml` (`[lints.clippy]`), or add `rustc_flags` to the Rust toolchain in `toolchains/BUCK`"
+        );
+        std::process::exit(1);
+    }
+
     let buck2_root = get_buck2_root().unwrap_or_exit_ctx("failed to get Buck2 project root");
     let cwd = std::env::current_dir().unwrap_or_exit_ctx("failed to get current directory");
     let mut relative = cwd
@@ -119,7 +137,13 @@ pub fn execute(args: &ClippyArgs) {
 
     let scope = workspace::resolve_scope(&args.package, args.workspace, &args.exclude, &relative)
         .unwrap_or_exit();
-    let available_targets = get_available_targets_in(&scope).unwrap_or_exit();
+    // Probe the host platform in the same sweep, but only when it is actually
+    // in play: an explicit `--target` / `--target-platforms` is validated on
+    // its own path and needs no probe.
+    let host_platform = (args.target.is_none() && args.target_platforms.is_none())
+        .then(|| format!("//platforms:{}", get_target()));
+    let scan = scan_targets_in(&scope, host_platform.as_deref()).unwrap_or_exit();
+    let available_targets = scan.targets;
 
     let target_platforms = if let Some(triple) = &args.target {
         match validate_target_triple(triple) {
@@ -132,18 +156,18 @@ pub fn execute(args: &ClippyArgs) {
     } else if let Some(platform) = &args.target_platforms {
         Some(platform.clone())
     } else {
-        let platform = format!("//platforms:{}", get_target());
-        if platform_exists(&platform) {
-            Some(platform)
-        } else {
-            None
-        }
+        host_platform.filter(|_| scan.platform_exists)
     };
 
     let mut buck2_cmd = Buck2Command::build().verbosity(args.verbose);
     if let Some(platform) = &target_platforms {
         buck2_cmd = buck2_cmd.arg("--target-platforms").arg(platform);
     }
+    // Absolute paths to every `[clippy.json]` we are about to build. Without
+    // this the artifacts are produced and never looked at, which is the whole
+    // bug: the clippy emit is infallible, so the build succeeding says nothing
+    // about what clippy found.
+    buck2_cmd = buck2_cmd.arg("--show-full-json-output");
 
     let mut target_specified = false;
 
@@ -164,9 +188,22 @@ pub fn execute(args: &ClippyArgs) {
         std::process::exit(1);
     }
 
-    match buck2_cmd.status() {
-        Ok(status) if status.success() => {}
-        _ => std::process::exit(1),
+    let output = match buck2_cmd.output_capturing_stdout() {
+        // A failed build is already reported by Buck2 on the stderr we let
+        // through, and leaves us no output map to read.
+        Ok(output) if !output.status.success() => std::process::exit(1),
+        Ok(output) => output,
+        Err(e) => {
+            buckal_error!(format!("failed to execute buck2 build: {e}"));
+            std::process::exit(1);
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (blocks, summary) = diagnostics::collect(&stdout).unwrap_or_exit();
+
+    if !diagnostics::report(&blocks, &summary, "clippy") {
+        std::process::exit(1);
     }
 }
 

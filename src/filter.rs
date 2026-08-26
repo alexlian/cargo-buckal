@@ -96,6 +96,52 @@ impl FilterRule {
     }
 }
 
+/// Reject a selection that names a Cargo target kind `migrate` never emits.
+///
+/// `buckify_root_node` generates rules for binary, library and test targets
+/// only — examples and benches reach neither (`is_lib_like` in `resolve.rs`
+/// excludes them and nothing downstream picks them up), so no BUCK graph
+/// contains one to select. Matching therefore cannot succeed, and the generic
+/// "all targets filtered out" that used to follow sent people auditing their
+/// filter arguments for a target that was never generated in the first place.
+///
+/// `--all-targets` deliberately does not come through here: it means "whatever
+/// exists", which is satisfiable, and CI depends on it.
+pub fn reject_ungenerated_kinds(
+    examples: &[String],
+    all_examples: bool,
+    benches: &[String],
+    all_benches: bool,
+) -> anyhow::Result<()> {
+    let flag = if all_examples {
+        Some("--examples")
+    } else if !examples.is_empty() {
+        Some("--example")
+    } else if all_benches {
+        Some("--benches")
+    } else if !benches.is_empty() {
+        Some("--bench")
+    } else {
+        None
+    };
+
+    match flag {
+        None => Ok(()),
+        Some(flag) => {
+            let kind = if flag.starts_with("--example") {
+                "example"
+            } else {
+                "bench"
+            };
+            bail!(
+                "`{flag}` cannot be satisfied: `cargo buckal migrate` does not generate \
+                 {kind} targets, so none exist in the BUCK graph. It emits rules for \
+                 library, binary and test targets only."
+            )
+        }
+    }
+}
+
 impl TargetFilter {
     /// Constructs a filter from raw command line arguments.
     #[allow(clippy::too_many_arguments)]
@@ -115,6 +161,7 @@ impl TargetFilter {
         if all_targets {
             return Ok(TargetFilter::new_all_targets());
         }
+        reject_ungenerated_kinds(&examples, all_examples, &benches, all_benches)?;
         let rule_lib = if lib_only {
             LibRule::True
         } else {
@@ -312,39 +359,109 @@ impl BuckTargetEntry {
     }
 }
 
+/// What one `buck2 targets` sweep tells a command.
+#[derive(Debug, Default)]
+pub struct TargetScan {
+    /// Buildable first-party Rust targets under the requested packages.
+    pub targets: Vec<BuckTargetEntry>,
+    /// Whether the platform label passed to [`scan_targets_in`] names a target
+    /// that exists. Always `false` when no platform was asked about.
+    pub platform_exists: bool,
+}
+
+/// Strip the cell name so `root//platforms:x` and `//platforms:x` compare equal.
+fn cell_relative(label: &str) -> &str {
+    match label.find("//") {
+        Some(index) => &label[index..],
+        None => label,
+    }
+}
+
 /// Get available targets from Buck2 under the specified package, and filter out non-Rust rules and third-party rules.
 pub fn get_available_targets(package: &str) -> anyhow::Result<Vec<BuckTargetEntry>> {
-    get_available_targets_in(&[package.to_string()])
+    Ok(scan_targets_in(&[package.to_string()], None)?.targets)
 }
 
 /// Like [`get_available_targets`], but queries several packages in a single
 /// `buck2 targets` invocation. Each entry is a Buck-relative package path
 /// (forward slashes); an empty entry means "the whole project" (`//...`).
 pub fn get_available_targets_in(packages: &[String]) -> anyhow::Result<Vec<BuckTargetEntry>> {
-    if packages.is_empty() {
-        return Ok(Vec::new());
-    }
+    Ok(scan_targets_in(packages, None)?.targets)
+}
 
-    let patterns: Vec<String> = if packages.iter().any(|p| p.is_empty()) {
+/// Enumerate targets and, in the same invocation, settle whether `platform`
+/// exists.
+///
+/// The existence question used to cost its own `buck2 uquery` — measured at
+/// ~190ms against a warm daemon, on the default path of every `build`,
+/// `check`, `clippy`, `test` and `run`. Buck2 serializes commands per daemon,
+/// so it could not be overlapped either; folding it into the enumeration that
+/// already runs is the only way to stop paying for it.
+///
+/// Naming a non-existent target fails the whole query, so a failure with the
+/// platform included is retried without it. That costs two invocations in the
+/// case that used to cost two anyway — a repo with no such platform — and one
+/// everywhere else.
+pub fn scan_targets_in(packages: &[String], platform: Option<&str>) -> anyhow::Result<TargetScan> {
+    let package_patterns: Vec<String> = if packages.is_empty() {
+        Vec::new()
+    } else if packages.iter().any(|p| p.is_empty()) {
         // A `//...` query subsumes every package-scoped pattern.
         vec!["//...".to_string()]
     } else {
         packages.iter().map(|p| format!("//{p}/...")).collect()
     };
 
+    if package_patterns.is_empty() && platform.is_none() {
+        return Ok(TargetScan::default());
+    }
+
+    if let Some(platform) = platform {
+        let mut patterns = package_patterns.clone();
+        patterns.push(platform.to_owned());
+
+        // A miss here is the expected "this repo has no such platform" case,
+        // not an error to report.
+        if let Ok(entries) = query_targets(&patterns) {
+            let platform_exists = entries
+                .iter()
+                .any(|entry| cell_relative(&entry.label()) == cell_relative(platform));
+            return Ok(TargetScan {
+                targets: keep_buildable(entries),
+                platform_exists,
+            });
+        }
+    }
+
+    if package_patterns.is_empty() {
+        return Ok(TargetScan::default());
+    }
+
+    Ok(TargetScan {
+        targets: keep_buildable(query_targets(&package_patterns)?),
+        platform_exists: false,
+    })
+}
+
+fn keep_buildable(entries: Vec<BuckTargetEntry>) -> Vec<BuckTargetEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.is_rust_rule() && !entry.is_third_party())
+        .collect()
+}
+
+fn query_targets(patterns: &[String]) -> anyhow::Result<Vec<BuckTargetEntry>> {
     let mut cmd = Buck2Command::targets();
-    for pattern in &patterns {
+    for pattern in patterns {
         cmd = cmd.arg(pattern);
     }
 
     match cmd.arg("--output-basic-attributes").arg("--json").output() {
         Ok(output) => {
             if output.status.success() {
-                let targets = serde_json::from_slice::<Vec<BuckTargetEntry>>(&output.stdout)?
-                    .into_iter()
-                    .filter(|entry| entry.is_rust_rule() && !entry.is_third_party())
-                    .collect();
-                Ok(targets)
+                Ok(serde_json::from_slice::<Vec<BuckTargetEntry>>(
+                    &output.stdout,
+                )?)
             } else {
                 bail!(
                     "failed to query Buck2 targets: {}",
@@ -368,6 +485,76 @@ mod tests {
             buck_package: "root//pkg".to_string(),
             name: name.to_string(),
         }
+    }
+
+    /// `migrate` emits no example or bench rules, so a selection naming one
+    /// can never match. Failing with that reason beats the generic "all
+    /// targets filtered out", which pointed at the filter arguments.
+    #[test]
+    fn example_and_bench_selections_are_rejected_with_the_reason() {
+        let reject =
+            |examples: &[&str], all_examples: bool, benches: &[&str], all_benches: bool| {
+                reject_ungenerated_kinds(
+                    &examples.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+                    all_examples,
+                    &benches.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+                    all_benches,
+                )
+                .expect_err("selection should be rejected")
+                .to_string()
+            };
+
+        for (message, flag) in [
+            (reject(&["demo"], false, &[], false), "--example"),
+            (reject(&[], true, &[], false), "--examples"),
+            (reject(&[], false, &["bench1"], false), "--bench"),
+            (reject(&[], false, &[], true), "--benches"),
+        ] {
+            assert!(message.contains(flag), "{flag}: {message}");
+            assert!(message.contains("does not generate"), "{flag}: {message}");
+        }
+    }
+
+    /// `--all-targets` means "whatever exists", which is satisfiable, and CI
+    /// relies on it. It must not be caught by the rejection above.
+    #[test]
+    fn all_targets_is_not_rejected() {
+        let filter = TargetFilter::from_raw_arguments(
+            false,
+            vec![],
+            false,
+            vec![],
+            false,
+            vec![],
+            false,
+            vec![],
+            false,
+            true,
+            FilterCaller::Build,
+        )
+        .expect("--all-targets must stay usable");
+
+        assert!(filter.is_all_targets());
+    }
+
+    #[test]
+    fn lib_bin_and_test_selections_are_still_accepted() {
+        let filter = TargetFilter::from_raw_arguments(
+            true,
+            vec!["app".into()],
+            false,
+            vec!["it".into()],
+            false,
+            vec![],
+            false,
+            vec![],
+            false,
+            false,
+            FilterCaller::Build,
+        )
+        .expect("generated kinds must stay selectable");
+
+        assert!(filter.is_specific());
     }
 
     #[test]

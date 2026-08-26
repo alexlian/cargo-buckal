@@ -570,6 +570,33 @@ mod tests {
         }
     }
 
+    /// The Rust side lowering against six (os, cpu) pairs is only half the
+    /// contract: the generated `//platforms:*` package has to offer a
+    /// `platform()` target for each of them, or a refined `os_deps` key lowers
+    /// to a `select()` branch no platform can match and the deps in it are
+    /// dropped with no diagnostic. This drifted once already — the template
+    /// carried four of the six, so `macos-x86_64` and `windows-arm64` branches
+    /// were unreachable in every generated repo.
+    ///
+    /// `//platforms/verify_deps.bxl:check` catches this in a real graph; this
+    /// test catches it before one is ever generated.
+    #[test]
+    fn test_platforms_template_covers_every_supported_triple() {
+        let template = include_str!("../assets/platforms/BUCK.template");
+
+        for (target, triple) in SUPPORTED_TARGETS {
+            let decl = format!("name = \"{triple}\"");
+            assert!(
+                template.contains(&decl),
+                "assets/platforms/BUCK.template has no `platform()` for {triple} \
+                 ({}-{}); deps keyed to that pair would lower to an unreachable \
+                 select() branch and be silently dropped",
+                target.os.key(),
+                target.arch.key()
+            );
+        }
+    }
+
     #[test]
     fn test_supported_targets_have_unique_triples() {
         let triples: BTreeSet<&str> = SUPPORTED_TARGETS.iter().map(|(_, t)| *t).collect();

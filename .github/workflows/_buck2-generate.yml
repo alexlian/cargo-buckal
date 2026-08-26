@@ -167,6 +167,24 @@ jobs:
             echo "No patches directory found at $PATCH_DIR"
           fi
 
+      # ============================================================
+      # Verify the (os, cpu) dependency matrix
+      #
+      # Analysis-only, so one runner proves the lowering for all six
+      # platforms -- including macos-x86_64 and windows-arm64, which no
+      # runner in the build matrix compiles. A dep keyed to a platform the
+      # repo cannot match is dropped from the graph with no diagnostic, so
+      # this is the only thing standing between that bug and a user.
+      # ============================================================
+      - name: Verify platform dep matrix
+        if: matrix.name == 'linux'
+        shell: bash
+        env:
+          PROJECT_DIR: ${{ inputs.project_dir || inputs.project_name || 'cargo-buckal' }}
+        run: |
+          cd "$PROJECT_DIR"
+          buck2 bxl //platforms/verify_deps.bxl:check
+
       - name: Upload generated tree
         uses: actions/upload-artifact@v7
         with:

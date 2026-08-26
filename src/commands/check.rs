@@ -2,11 +2,11 @@ use clap::Parser;
 
 use crate::{
     buck2::Buck2Command,
-    buckal_error, buckal_note,
-    filter::{FilterCaller, TargetFilter, get_available_targets_in},
+    buckal_error, buckal_note, diagnostics,
+    filter::{FilterCaller, TargetFilter, scan_targets_in},
     utils::{
         UnwrapOrExit, ensure_prerequisites, get_buck2_root, get_target, is_inside_buck2_project,
-        platform_exists, validate_target_triple,
+        validate_target_triple,
     },
     workspace,
 };
@@ -119,7 +119,13 @@ pub fn execute(args: &CheckArgs) {
 
     let scope = workspace::resolve_scope(&args.package, args.workspace, &args.exclude, &relative)
         .unwrap_or_exit();
-    let available_targets = get_available_targets_in(&scope).unwrap_or_exit();
+    // Probe the host platform in the same sweep, but only when it is actually
+    // in play: an explicit `--target` / `--target-platforms` is validated on
+    // its own path and needs no probe.
+    let host_platform = (args.target.is_none() && args.target_platforms.is_none())
+        .then(|| format!("//platforms:{}", get_target()));
+    let scan = scan_targets_in(&scope, host_platform.as_deref()).unwrap_or_exit();
+    let available_targets = scan.targets;
 
     let target_platforms = if let Some(triple) = &args.target {
         match validate_target_triple(triple) {
@@ -132,12 +138,7 @@ pub fn execute(args: &CheckArgs) {
     } else if let Some(platform) = &args.target_platforms {
         Some(platform.clone())
     } else {
-        let platform = format!("//platforms:{}", get_target());
-        if platform_exists(&platform) {
-            Some(platform)
-        } else {
-            None
-        }
+        host_platform.filter(|_| scan.platform_exists)
     };
 
     let mut buck2_cmd = Buck2Command::build().verbosity(args.verbose);
@@ -148,12 +149,21 @@ pub fn execute(args: &CheckArgs) {
         buck2_cmd = buck2_cmd.arg("--target-platforms").arg(platform);
     }
 
+    buck2_cmd = buck2_cmd.arg("--show-full-json-output");
+
     let mut target_specified = false;
 
-    // Add [check] sub-targets to the command based on the filter
+    // `[diag.json]` rather than `[check]`, which is the same `metadata-fast`
+    // compile seen from the other side. `[check]` is that action's output run
+    // through `failure_filter`, so it fails the build on a compile error and
+    // says nothing at all about warnings; `[diag.json]` is the raw diagnostic
+    // stream, produced infallibly, carrying both. Reading it lets errors and
+    // warnings be reported the same way — and the same way `clippy` reports
+    // them — instead of errors arriving as a Buck2 action dump and warnings
+    // never arriving at all.
     for target in &available_targets {
         if target_filter.target_run(target) {
-            buck2_cmd = buck2_cmd.arg(format!("{}[check]", target.label()));
+            buck2_cmd = buck2_cmd.arg(format!("{}[diag.json]", target.label()));
             target_specified = true;
         }
     }
@@ -166,9 +176,23 @@ pub fn execute(args: &CheckArgs) {
         std::process::exit(1);
     }
 
-    match buck2_cmd.status() {
-        Ok(status) if status.success() => {}
-        _ => std::process::exit(1),
+    let output = match buck2_cmd.output_capturing_stdout() {
+        // The diagnostic stream is infallible, so a failed build here means
+        // something upstream never produced metadata — Buck2 has already said
+        // so on the stderr we let through, and there is no output map to read.
+        Ok(output) if !output.status.success() => std::process::exit(1),
+        Ok(output) => output,
+        Err(e) => {
+            buckal_error!(format!("failed to execute buck2 build: {e}"));
+            std::process::exit(1);
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (blocks, summary) = diagnostics::collect(&stdout).unwrap_or_exit();
+
+    if !diagnostics::report(&blocks, &summary, "check") {
+        std::process::exit(1);
     }
 }
 

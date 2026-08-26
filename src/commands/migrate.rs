@@ -4,9 +4,9 @@ use clap::Parser;
 
 use crate::{
     RUST_CRATES_ROOT, RUST_GIT_ROOT,
-    assets::extract_buck2_assets,
+    assets::{extract_buck2_assets, upgrade_platform_assets},
     buck2::Buck2Command,
-    buckal_error,
+    buckal_error, buckal_log,
     bundles::{fetch_buckal_cell, init_buckal_cell, init_modifier},
     cache::BuckalCache,
     context::BuckalContext,
@@ -107,6 +107,22 @@ pub fn execute(args: &MigrateArgs) {
     if args.fetch {
         let cwd = std::env::current_dir().unwrap_or_exit();
         fetch_buckal_cell(&cwd).unwrap_or_exit();
+    }
+
+    // Bring `platforms/BUCK` up to date with the (os, cpu) matrix this version
+    // lowers against. Unconditional rather than opt-in because the drift it
+    // repairs is silent: a dependency keyed to a pair the repo has no
+    // `platform()` for lowers to an unreachable `select()` branch and is
+    // dropped from the build with no diagnostic. Additive, so hand-edits stay.
+    if let Ok(buck2_root) = get_buck2_root() {
+        let upgrade = upgrade_platform_assets(buck2_root.as_std_path())
+            .unwrap_or_exit_ctx("failed to upgrade platform definitions");
+        for path in &upgrade.files {
+            buckal_log!("Adding", path);
+        }
+        for name in &upgrade.platforms {
+            buckal_log!("Adding", format!("//platforms:{name}"));
+        }
     }
 
     // get cargo metadata and generate context

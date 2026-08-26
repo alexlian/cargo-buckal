@@ -3,10 +3,10 @@ use clap::Parser;
 use crate::{
     buck2::Buck2Command,
     buckal_error, buckal_log,
-    filter::{BuckTargetEntry, get_available_targets},
+    filter::{BuckTargetEntry, reject_ungenerated_kinds, scan_targets_in},
     utils::{
         UnwrapOrExit, ensure_prerequisites, get_buck2_root, get_target, is_inside_buck2_project,
-        platform_exists, validate_target_triple,
+        validate_target_triple,
     },
     workspace,
 };
@@ -76,8 +76,14 @@ pub fn execute(args: &RunArgs) {
         relative = workspace::resolve_member_path(pkg).unwrap_or_exit();
     }
 
+    // One sweep answers both "which binaries are there" and "does the host
+    // platform exist"; see `scan_targets_in`.
+    let host_platform = (args.target.is_none() && args.target_platforms.is_none())
+        .then(|| format!("//platforms:{}", get_target()));
+    let scan = scan_targets_in(&[relative.clone()], host_platform.as_deref()).unwrap_or_exit();
+
     // Resolve the single target to run
-    let target = resolve_run_target(args, &relative);
+    let target = resolve_run_target(args, &relative, &scan.targets);
 
     let target_platforms = if let Some(triple) = &args.target {
         match validate_target_triple(triple) {
@@ -90,12 +96,7 @@ pub fn execute(args: &RunArgs) {
     } else if let Some(platform) = &args.target_platforms {
         Some(platform.clone())
     } else {
-        let platform = format!("//platforms:{}", get_target());
-        if platform_exists(&platform) {
-            Some(platform)
-        } else {
-            None
-        }
+        host_platform.filter(|_| scan.platform_exists)
     };
 
     let mut buck2_cmd = Buck2Command::run().arg(&target).verbosity(args.verbose);
@@ -136,12 +137,20 @@ pub fn execute(args: &RunArgs) {
 }
 
 /// Resolve which single target to run
-fn resolve_run_target(args: &RunArgs, relative: &str) -> String {
+fn resolve_run_target(
+    args: &RunArgs,
+    relative: &str,
+    available_targets: &[BuckTargetEntry],
+) -> String {
+    // This used to hand Buck2 `//<pkg>:<example>` and let it fail with a
+    // target-not-found, which reads as a typo rather than as the limitation it
+    // is: `migrate` emits no example rules at all. See
+    // `reject_ungenerated_kinds`.
     if let Some(example_name) = &args.example {
+        reject_ungenerated_kinds(std::slice::from_ref(example_name), false, &[], false)
+            .unwrap_or_exit();
         return format!("//{relative}:{example_name}");
     }
-
-    let available_targets = get_available_targets(relative).unwrap_or_exit();
 
     let binaries: Vec<_> = available_targets
         .iter()

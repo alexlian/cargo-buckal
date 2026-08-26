@@ -3,10 +3,10 @@ use clap::Parser;
 use crate::{
     buck2::Buck2Command,
     buckal_error, buckal_note,
-    filter::{FilterCaller, TargetFilter, get_available_targets_in},
+    filter::{FilterCaller, TargetFilter, scan_targets_in},
     utils::{
         UnwrapOrExit, ensure_prerequisites, get_buck2_root, get_target, is_inside_buck2_project,
-        platform_exists, validate_target_triple,
+        validate_target_triple,
     },
     workspace,
 };
@@ -155,7 +155,13 @@ pub fn execute(args: &TestArgs) {
 
     let scope = workspace::resolve_scope(&args.package, args.workspace, &args.exclude, &relative)
         .unwrap_or_exit();
-    let available_targets = get_available_targets_in(&scope).unwrap_or_exit();
+    // Probe the host platform in the same sweep, but only when it is actually
+    // in play: an explicit `--target` / `--target-platforms` is validated on
+    // its own path and needs no probe.
+    let host_platform = (args.target.is_none() && args.target_platforms.is_none())
+        .then(|| format!("//platforms:{}", get_target()));
+    let scan = scan_targets_in(&scope, host_platform.as_deref()).unwrap_or_exit();
+    let available_targets = scan.targets;
 
     let mut buck2_cmd = if args.no_run {
         Buck2Command::build().verbosity(args.verbose)
@@ -179,12 +185,7 @@ pub fn execute(args: &TestArgs) {
     } else if let Some(platform) = &args.target_platforms {
         Some(platform.clone())
     } else {
-        let platform = format!("//platforms:{}", get_target());
-        if platform_exists(&platform) {
-            Some(platform)
-        } else {
-            None
-        }
+        host_platform.filter(|_| scan.platform_exists)
     };
     if let Some(platform) = &target_platforms {
         buck2_cmd = buck2_cmd.arg("--target-platforms").arg(platform);
