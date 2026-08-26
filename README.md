@@ -77,15 +77,26 @@ buck2_binary = "/path/to/your/buck2"
 
 If no configuration file exists, cargo-buckal will use `buck2` (searches your PATH).
 
-To redirect dependency labels from one resolved version to another, add entries to the repo-local
-`buckal.toml`:
+`buckal.toml` is the repo-local configuration, read from the Buck2 project root. Every key lives at
+the file root — there is no enclosing section — and an unrecognised key is an error rather than a
+silent fallback, because the defaults are not neutral.
 
 ```toml
+# Generate `rust_test` targets. Defaults to `true`, meaning no test targets
+# are generated at all: no library `unittest`, no per-binary `<bin>-unittest`,
+# no integration tests. Set it to false to get them.
+ignore_tests = false
+
+# Fields to preserve in existing BUCK rules when regenerating, so hand-written
+# additions survive a `migrate`. Empty by default.
+patch_fields = ["env"]
+
+# Redirect dependency labels from one resolved version to another.
 [patch.version]
 pyo3 = { from = "0.26.0", to = "0.27.2" }
 ```
 
-You can also write these entries with `cargo buckal patch pyo3@0.27.2`.
+You can also write `[patch.version]` entries with `cargo buckal patch pyo3@0.27.2`.
 
 ## Pre-commit Hooks
 
