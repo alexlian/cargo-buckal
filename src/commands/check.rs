@@ -307,12 +307,12 @@ mod tests {
 
     #[test]
     fn cli_check_accepts_package_and_workspace() {
-        let cli = Cli::try_parse_from(["cargo", "buckal", "check", "-p", "mm_core"])
+        let cli = Cli::try_parse_from(["cargo", "buckal", "check", "-p", "alpha"])
             .expect("failed to parse check -p");
         match cli.command {
             Commands::Buckal(args) => match args.subcommands {
                 Some(BuckalSubCommands::Check(check_args)) => {
-                    assert_eq!(check_args.package, vec!["mm_core"]);
+                    assert_eq!(check_args.package, vec!["alpha"]);
                     assert!(!check_args.workspace);
                 }
                 other => panic!("expected check subcommand, got {other:?}"),

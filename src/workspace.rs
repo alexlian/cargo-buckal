@@ -136,35 +136,35 @@ mod tests {
 
     fn members() -> Vec<WorkspaceMember> {
         vec![
-            member("mm_core", "src/core"),
-            member("mm_ai", "src/ai"),
-            member("mm_server", "src/server"),
+            member("alpha", "src/alpha"),
+            member("beta", "src/beta"),
+            member("gamma", "src/gamma"),
         ]
     }
 
     #[test]
     fn workspace_selects_all_members() {
         let paths = select_scope_paths(&members(), &[], true, &[]).expect("scope");
-        assert_eq!(paths, vec!["src/ai", "src/core", "src/server"]);
+        assert_eq!(paths, vec!["src/alpha", "src/beta", "src/gamma"]);
     }
 
     #[test]
     fn workspace_honors_exclude() {
         let paths =
-            select_scope_paths(&members(), &[], true, &["mm_ai".to_string()]).expect("scope");
-        assert_eq!(paths, vec!["src/core", "src/server"]);
+            select_scope_paths(&members(), &[], true, &["beta".to_string()]).expect("scope");
+        assert_eq!(paths, vec!["src/alpha", "src/gamma"]);
     }
 
     #[test]
     fn package_subset_preserves_request_but_dedups() {
         let paths = select_scope_paths(
             &members(),
-            &["mm_server".to_string(), "mm_core".to_string()],
+            &["gamma".to_string(), "alpha".to_string()],
             false,
             &[],
         )
         .expect("scope");
-        assert_eq!(paths, vec!["src/core", "src/server"]);
+        assert_eq!(paths, vec!["src/alpha", "src/gamma"]);
     }
 
     #[test]
@@ -178,9 +178,9 @@ mod tests {
     fn exclude_without_workspace_is_an_error() {
         let err = select_scope_paths(
             &members(),
-            &["mm_core".to_string()],
+            &["alpha".to_string()],
             false,
-            &["mm_ai".to_string()],
+            &["beta".to_string()],
         )
         .expect_err("exclude without workspace should fail");
         assert!(err.to_string().contains("`--workspace`"));
@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn member_at_root_collapses_to_recursive_pattern() {
         let mut ms = members();
-        ms.push(member("mm_workspace", ""));
+        ms.push(member("root_pkg", ""));
         let paths = select_scope_paths(&ms, &[], true, &[]).expect("scope");
         assert_eq!(paths, vec![String::new()]);
     }

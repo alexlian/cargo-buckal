@@ -242,9 +242,9 @@ mod tests {
 
     #[test]
     fn ignores_a_source_suffix() {
-        let out = parse("mm_server v0.1.0 (/home/x/src/mm_server)|default,http\n");
+        let out = parse("gamma v0.1.0 (/home/x/src/gamma)|default,http\n");
         assert_eq!(
-            out[&("mm_server".to_string(), "0.1.0".to_string())],
+            out[&("gamma".to_string(), "0.1.0".to_string())],
             BTreeSet::from(["default".to_string(), "http".to_string()])
         );
     }

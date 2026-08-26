@@ -259,12 +259,12 @@ mod tests {
 
     #[test]
     fn cli_test_accepts_package() {
-        let args = test_args(&["cargo", "buckal", "test", "-p", "mm_e2e"]);
-        assert_eq!(args.package, vec!["mm_e2e"]);
+        let args = test_args(&["cargo", "buckal", "test", "-p", "alpha"]);
+        assert_eq!(args.package, vec!["alpha"]);
         assert!(!args.workspace);
 
-        let args = test_args(&["cargo", "buckal", "test", "--package", "mm_e2e"]);
-        assert_eq!(args.package, vec!["mm_e2e"]);
+        let args = test_args(&["cargo", "buckal", "test", "--package", "alpha"]);
+        assert_eq!(args.package, vec!["alpha"]);
     }
 
     #[test]
@@ -275,10 +275,10 @@ mod tests {
             "test",
             "--workspace",
             "--exclude",
-            "mm_e2e",
+            "alpha",
         ]);
         assert!(args.workspace);
-        assert_eq!(args.exclude, vec!["mm_e2e"]);
+        assert_eq!(args.exclude, vec!["alpha"]);
     }
 
     #[test]
