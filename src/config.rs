@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    buckal_warn,
+    buckal_error, buckal_note,
     utils::{UnwrapOrExit, get_buck2_root},
 };
 
@@ -209,25 +209,29 @@ impl RepoConfig {
             return Self::default();
         }
 
-        match fs::read_to_string(&repo_config_path) {
-            Ok(content) => match toml::from_str::<RepoConfig>(&content) {
-                Ok(config) => config,
-                Err(_) => {
-                    buckal_warn!(
-                        "Failed to parse repo config file at {}, using defaults",
-                        repo_config_path.display()
-                    );
-                    Self::default()
-                }
-            },
-            Err(_) => {
-                buckal_warn!(
-                    "Failed to read repo config file at {}, using defaults",
-                    repo_config_path.display()
-                );
-                Self::default()
-            }
-        }
+        // A file that exists but cannot be honoured is an error, not a
+        // fallback. Continuing on defaults would generate a BUCK graph that
+        // ignores what the repo asked for -- and since `ignore_tests` defaults
+        // to `true`, the most likely shape of that is a graph with no test
+        // rules at all, produced with a single warning that scrolls past.
+        let content = fs::read_to_string(&repo_config_path).unwrap_or_else(|e| {
+            buckal_error!(format!(
+                "failed to read `{}`: {e}",
+                repo_config_path.display()
+            ));
+            std::process::exit(1);
+        });
+
+        toml::from_str::<RepoConfig>(&content).unwrap_or_else(|e| {
+            buckal_error!(format!(
+                "failed to parse `{}`: {e}",
+                repo_config_path.display()
+            ));
+            buckal_note!(
+                "supported keys are `ignore_tests`, `patch_fields` and `[patch.version]`, all at the file root"
+            );
+            std::process::exit(1);
+        })
     }
 
     pub fn repo_config_path() -> PathBuf {
