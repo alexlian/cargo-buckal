@@ -98,6 +98,40 @@ pyo3 = { from = "0.26.0", to = "0.27.2" }
 
 You can also write `[patch.version]` entries with `cargo buckal patch pyo3@0.27.2`.
 
+### Test targets
+
+With `ignore_tests = false`, `migrate` mirrors Cargo's own test layout:
+
+| Cargo | generated rule |
+| --- | --- |
+| `src/lib.rs` `#[cfg(test)]` | `rust_test` named `unittest` |
+| each `src/bin/*.rs` (or `[[bin]]`) | `rust_test` named `<bin>-unittest` |
+| each `tests/*.rs` | one `rust_test` per file |
+
+A binary gets its rule whenever Cargo's per-target `test` flag is on, which is
+the default — not when the file happens to contain `#[cfg(test)]`. This matches
+`cargo test`, which builds and runs a harness for every binary and reports
+`0 passed` for one with no tests. Keying off the presence of test code instead
+would miss tests declared in a sibling file (`mod tests;`), behind `cfg_attr`,
+or produced by a macro, and would silently generate nothing for them — a suite
+that passes over tests that were never compiled is worse than one that is
+honestly empty.
+
+The cost is one extra compile and link per binary, so if a binary will never
+have unit tests, opt it out in `Cargo.toml` rather than working around it:
+
+```toml
+[[bin]]
+name = "scale_seed"
+path = "src/bin/scale_seed.rs"
+test = false
+```
+
+`cargo` and `cargo buckal` both honour that, so the two lanes stay in step.
+
+Note that `build`, `check` and `clippy` never build test targets — only
+`cargo buckal test`, and any command given `--tests` or `--all-targets`.
+
 ## Pre-commit Hooks
 
 This project uses [prek](https://github.com/j178/prek) for pre-commit hooks (configured in `.pre-commit-config.yaml`).
