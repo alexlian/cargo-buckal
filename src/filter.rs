@@ -96,6 +96,52 @@ impl FilterRule {
     }
 }
 
+/// Reject a selection that names a Cargo target kind `migrate` never emits.
+///
+/// `buckify_root_node` generates rules for binary, library and test targets
+/// only — examples and benches reach neither (`is_lib_like` in `resolve.rs`
+/// excludes them and nothing downstream picks them up), so no BUCK graph
+/// contains one to select. Matching therefore cannot succeed, and the generic
+/// "all targets filtered out" that used to follow sent people auditing their
+/// filter arguments for a target that was never generated in the first place.
+///
+/// `--all-targets` deliberately does not come through here: it means "whatever
+/// exists", which is satisfiable, and CI depends on it.
+pub fn reject_ungenerated_kinds(
+    examples: &[String],
+    all_examples: bool,
+    benches: &[String],
+    all_benches: bool,
+) -> anyhow::Result<()> {
+    let flag = if all_examples {
+        Some("--examples")
+    } else if !examples.is_empty() {
+        Some("--example")
+    } else if all_benches {
+        Some("--benches")
+    } else if !benches.is_empty() {
+        Some("--bench")
+    } else {
+        None
+    };
+
+    match flag {
+        None => Ok(()),
+        Some(flag) => {
+            let kind = if flag.starts_with("--example") {
+                "example"
+            } else {
+                "bench"
+            };
+            bail!(
+                "`{flag}` cannot be satisfied: `cargo buckal migrate` does not generate \
+                 {kind} targets, so none exist in the BUCK graph. It emits rules for \
+                 library, binary and test targets only."
+            )
+        }
+    }
+}
+
 impl TargetFilter {
     /// Constructs a filter from raw command line arguments.
     #[allow(clippy::too_many_arguments)]
@@ -115,6 +161,7 @@ impl TargetFilter {
         if all_targets {
             return Ok(TargetFilter::new_all_targets());
         }
+        reject_ungenerated_kinds(&examples, all_examples, &benches, all_benches)?;
         let rule_lib = if lib_only {
             LibRule::True
         } else {
@@ -438,6 +485,76 @@ mod tests {
             buck_package: "root//pkg".to_string(),
             name: name.to_string(),
         }
+    }
+
+    /// `migrate` emits no example or bench rules, so a selection naming one
+    /// can never match. Failing with that reason beats the generic "all
+    /// targets filtered out", which pointed at the filter arguments.
+    #[test]
+    fn example_and_bench_selections_are_rejected_with_the_reason() {
+        let reject =
+            |examples: &[&str], all_examples: bool, benches: &[&str], all_benches: bool| {
+                reject_ungenerated_kinds(
+                    &examples.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+                    all_examples,
+                    &benches.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+                    all_benches,
+                )
+                .expect_err("selection should be rejected")
+                .to_string()
+            };
+
+        for (message, flag) in [
+            (reject(&["demo"], false, &[], false), "--example"),
+            (reject(&[], true, &[], false), "--examples"),
+            (reject(&[], false, &["bench1"], false), "--bench"),
+            (reject(&[], false, &[], true), "--benches"),
+        ] {
+            assert!(message.contains(flag), "{flag}: {message}");
+            assert!(message.contains("does not generate"), "{flag}: {message}");
+        }
+    }
+
+    /// `--all-targets` means "whatever exists", which is satisfiable, and CI
+    /// relies on it. It must not be caught by the rejection above.
+    #[test]
+    fn all_targets_is_not_rejected() {
+        let filter = TargetFilter::from_raw_arguments(
+            false,
+            vec![],
+            false,
+            vec![],
+            false,
+            vec![],
+            false,
+            vec![],
+            false,
+            true,
+            FilterCaller::Build,
+        )
+        .expect("--all-targets must stay usable");
+
+        assert!(filter.is_all_targets());
+    }
+
+    #[test]
+    fn lib_bin_and_test_selections_are_still_accepted() {
+        let filter = TargetFilter::from_raw_arguments(
+            true,
+            vec!["app".into()],
+            false,
+            vec!["it".into()],
+            false,
+            vec![],
+            false,
+            vec![],
+            false,
+            false,
+            FilterCaller::Build,
+        )
+        .expect("generated kinds must stay selectable");
+
+        assert!(filter.is_specific());
     }
 
     #[test]

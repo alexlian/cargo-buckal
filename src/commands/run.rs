@@ -3,7 +3,7 @@ use clap::Parser;
 use crate::{
     buck2::Buck2Command,
     buckal_error, buckal_log,
-    filter::{BuckTargetEntry, scan_targets_in},
+    filter::{BuckTargetEntry, reject_ungenerated_kinds, scan_targets_in},
     utils::{
         UnwrapOrExit, ensure_prerequisites, get_buck2_root, get_target, is_inside_buck2_project,
         validate_target_triple,
@@ -142,7 +142,13 @@ fn resolve_run_target(
     relative: &str,
     available_targets: &[BuckTargetEntry],
 ) -> String {
+    // This used to hand Buck2 `//<pkg>:<example>` and let it fail with a
+    // target-not-found, which reads as a typo rather than as the limitation it
+    // is: `migrate` emits no example rules at all. See
+    // `reject_ungenerated_kinds`.
     if let Some(example_name) = &args.example {
+        reject_ungenerated_kinds(std::slice::from_ref(example_name), false, &[], false)
+            .unwrap_or_exit();
         return format!("//{relative}:{example_name}");
     }
 
