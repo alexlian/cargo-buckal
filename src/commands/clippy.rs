@@ -2,7 +2,7 @@ use clap::Parser;
 
 use crate::{
     buck2::Buck2Command,
-    buckal_error, buckal_note,
+    buckal_error, buckal_log, buckal_note, buckal_warn, diagnostics,
     filter::{FilterCaller, TargetFilter, get_available_targets_in},
     utils::{
         UnwrapOrExit, ensure_prerequisites, get_buck2_root, get_target, is_inside_buck2_project,
@@ -91,6 +91,24 @@ pub fn execute(args: &ClippyArgs) {
         std::process::exit(1);
     }
 
+    // These were accepted and dropped on the floor. Buck2 has no CLI knob for
+    // appending rustc flags to arbitrary targets — the prelude's Rust
+    // toolchain takes `rustc_flags` as a rule attribute, not from a
+    // `read_config` — so there is nothing to forward them to. Refusing is the
+    // honest failure: a silent no-op reads as "clippy ran with my lint levels"
+    // when it ran without them.
+    if !args.args.is_empty() {
+        buckal_error!(format!(
+            "`cargo buckal clippy -- {}` is not supported: Buck2 has no way to \
+             apply extra lint flags to a target at the command line",
+            args.args.join(" ")
+        ));
+        buckal_note!(
+            "set the lint levels in `Cargo.toml` (`[lints.clippy]`), or add `rustc_flags` to the Rust toolchain in `toolchains/BUCK`"
+        );
+        std::process::exit(1);
+    }
+
     let buck2_root = get_buck2_root().unwrap_or_exit_ctx("failed to get Buck2 project root");
     let cwd = std::env::current_dir().unwrap_or_exit_ctx("failed to get current directory");
     let mut relative = cwd
@@ -144,6 +162,11 @@ pub fn execute(args: &ClippyArgs) {
     if let Some(platform) = &target_platforms {
         buck2_cmd = buck2_cmd.arg("--target-platforms").arg(platform);
     }
+    // Absolute paths to every `[clippy.json]` we are about to build. Without
+    // this the artifacts are produced and never looked at, which is the whole
+    // bug: the clippy emit is infallible, so the build succeeding says nothing
+    // about what clippy found.
+    buck2_cmd = buck2_cmd.arg("--show-full-json-output");
 
     let mut target_specified = false;
 
@@ -164,9 +187,47 @@ pub fn execute(args: &ClippyArgs) {
         std::process::exit(1);
     }
 
-    match buck2_cmd.status() {
-        Ok(status) if status.success() => {}
-        _ => std::process::exit(1),
+    let output = match buck2_cmd.output_capturing_stdout() {
+        // A failed build is already reported by Buck2 on the stderr we let
+        // through, and leaves us no output map to read.
+        Ok(output) if !output.status.success() => std::process::exit(1),
+        Ok(output) => output,
+        Err(e) => {
+            buckal_error!(format!("failed to execute buck2 build: {e}"));
+            std::process::exit(1);
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let paths = diagnostics::output_paths(&stdout).unwrap_or_exit();
+
+    let mut records = Vec::new();
+    for path in &paths {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => records.extend(diagnostics::parse_stream(&contents)),
+            Err(e) => buckal_warn!(format!(
+                "could not read clippy diagnostics at `{}`: {e}",
+                path.display()
+            )),
+        }
+    }
+
+    let (blocks, summary) = diagnostics::render(records);
+    for block in &blocks {
+        eprintln!("{block}");
+    }
+
+    if summary.errors > 0 {
+        buckal_error!(format!(
+            "clippy found {} error(s) and {} warning(s)",
+            summary.errors, summary.warnings
+        ));
+        std::process::exit(1);
+    }
+    if summary.warnings > 0 {
+        buckal_warn!(format!("clippy found {} warning(s)", summary.warnings));
+    } else if summary.is_clean() {
+        buckal_log!("Finished", "clippy found no issues");
     }
 }
 

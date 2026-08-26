@@ -53,6 +53,19 @@ impl Buck2Command {
             .output()
     }
 
+    /// Execute the command capturing stdout but letting stderr through.
+    ///
+    /// Buck2 writes machine-readable output (`--show-full-json-output`) to
+    /// stdout and its progress UI to stderr, so capturing only stdout keeps
+    /// the build looking like a build while still returning the data.
+    /// `Output::stderr` is empty as a result.
+    pub fn output_capturing_stdout(mut self) -> io::Result<std::process::Output> {
+        self.command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .output()
+    }
+
     /// Execute the command with inherited stdio and expect success
     pub fn execute(self) -> io::Result<()> {
         let status = self.status()?;
