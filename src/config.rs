@@ -160,8 +160,16 @@ fn set_permissions(_file: &File) -> Result<()> {
     Ok(())
 }
 
+/// Repo-local settings, read from `buckal.toml` at the Buck2 project root.
+///
+/// `deny_unknown_fields` is load-bearing rather than tidiness. Every field
+/// here has a default, and the default for `ignore_tests` is `true` -- so a
+/// key that fails to bind does not degrade, it silently switches test-target
+/// generation off and `rust_test` rules vanish from every BUCK file. A
+/// singular `ignore_test`, or settings nested under a `[repo]` section that
+/// does not exist, both used to parse cleanly and do exactly that.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RepoConfig {
     pub align_cells: bool,
     pub ignore_tests: bool,
@@ -231,6 +239,49 @@ impl RepoConfig {
 #[cfg(test)]
 mod tests {
     use super::RepoConfig;
+
+    /// A key that does not bind must not be shrugged off: `ignore_tests`
+    /// defaults to `true`, so a typo silently removes every `rust_test` rule.
+    #[test]
+    fn test_repo_config_rejects_a_misspelled_key() {
+        let err = toml::from_str::<RepoConfig>("ignore_test = false\n")
+            .expect_err("a misspelled key must not parse");
+
+        assert!(
+            err.to_string().contains("ignore_test"),
+            "the error should name the offending key, got: {err}"
+        );
+    }
+
+    /// The shape both known consumers warn about in a hand-written comment:
+    /// settings nested under a `[repo]` section that has never existed.
+    #[test]
+    fn test_repo_config_rejects_a_nonexistent_section() {
+        let err = toml::from_str::<RepoConfig>("[repo]\nignore_tests = false\n")
+            .expect_err("an unknown section must not parse");
+
+        assert!(
+            err.to_string().contains("repo"),
+            "the error should name the offending section, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_repo_config_still_accepts_every_supported_key() {
+        let config: RepoConfig = toml::from_str(
+            r#"
+                ignore_tests = false
+                patch_fields = ["env"]
+
+                [patch.version]
+                pyo3 = { from = "0.26.0", to = "0.27.2" }
+            "#,
+        )
+        .expect("the documented keys must keep parsing");
+
+        assert!(!config.ignore_tests);
+        assert!(config.patch_fields.contains("env"));
+    }
 
     #[test]
     fn test_repo_config_deserializes_version_patch() {
