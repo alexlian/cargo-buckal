@@ -171,7 +171,6 @@ fn set_permissions(_file: &File) -> Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RepoConfig {
-    pub align_cells: bool,
     pub ignore_tests: bool,
     pub patch_fields: Set<String>,
     pub patch: RepoPatchConfig,
@@ -180,7 +179,6 @@ pub struct RepoConfig {
 impl Default for RepoConfig {
     fn default() -> Self {
         Self {
-            align_cells: false,
             ignore_tests: true,
             patch_fields: Set::new(),
             patch: RepoPatchConfig::default(),
