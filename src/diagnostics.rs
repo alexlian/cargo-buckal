@@ -18,6 +18,8 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
+use crate::{buckal_error, buckal_log, buckal_warn};
+
 /// One record of a rustc JSON diagnostic stream.
 ///
 /// Deliberately partial: rustc's schema is large and unstable, and everything
@@ -143,6 +145,55 @@ pub fn render(diagnostics: Vec<Diagnostic>) -> (Vec<String>, DiagnosticSummary) 
     }
 
     (seen, summary)
+}
+
+/// Read every artifact named by a `--show-full-json-output` map and reduce it
+/// to the blocks to print and the tally.
+///
+/// An unreadable artifact warns rather than aborts: one missing file should
+/// cost its own diagnostics, not the rest of the run's.
+pub fn collect(stdout: &str) -> Result<(Vec<String>, DiagnosticSummary)> {
+    let paths = output_paths(stdout)?;
+
+    let mut records = Vec::new();
+    for path in &paths {
+        match std::fs::read_to_string(path) {
+            Ok(contents) => records.extend(parse_stream(&contents)),
+            Err(e) => buckal_warn!(format!(
+                "could not read diagnostics at `{}`: {e}",
+                path.display()
+            )),
+        }
+    }
+
+    Ok(render(records))
+}
+
+/// Print the diagnostics and a closing summary; report whether the command
+/// should succeed.
+///
+/// Follows cargo: warnings alone are not a failure, errors are. `what` names
+/// the command in the summary line (`clippy`, `check`).
+pub fn report(blocks: &[String], summary: &DiagnosticSummary, what: &str) -> bool {
+    for block in blocks {
+        eprintln!("{block}");
+    }
+
+    if summary.errors > 0 {
+        buckal_error!(format!(
+            "{what} found {} error(s) and {} warning(s)",
+            summary.errors, summary.warnings
+        ));
+        return false;
+    }
+
+    if summary.warnings > 0 {
+        buckal_warn!(format!("{what} found {} warning(s)", summary.warnings));
+    } else {
+        buckal_log!("Finished", format!("{what} found no issues"));
+    }
+
+    true
 }
 
 #[cfg(test)]

@@ -2,7 +2,7 @@ use clap::Parser;
 
 use crate::{
     buck2::Buck2Command,
-    buckal_error, buckal_log, buckal_note, buckal_warn, diagnostics,
+    buckal_error, buckal_note, diagnostics,
     filter::{FilterCaller, TargetFilter, get_available_targets_in},
     utils::{
         UnwrapOrExit, ensure_prerequisites, get_buck2_root, get_target, is_inside_buck2_project,
@@ -199,35 +199,10 @@ pub fn execute(args: &ClippyArgs) {
     };
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let paths = diagnostics::output_paths(&stdout).unwrap_or_exit();
+    let (blocks, summary) = diagnostics::collect(&stdout).unwrap_or_exit();
 
-    let mut records = Vec::new();
-    for path in &paths {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => records.extend(diagnostics::parse_stream(&contents)),
-            Err(e) => buckal_warn!(format!(
-                "could not read clippy diagnostics at `{}`: {e}",
-                path.display()
-            )),
-        }
-    }
-
-    let (blocks, summary) = diagnostics::render(records);
-    for block in &blocks {
-        eprintln!("{block}");
-    }
-
-    if summary.errors > 0 {
-        buckal_error!(format!(
-            "clippy found {} error(s) and {} warning(s)",
-            summary.errors, summary.warnings
-        ));
+    if !diagnostics::report(&blocks, &summary, "clippy") {
         std::process::exit(1);
-    }
-    if summary.warnings > 0 {
-        buckal_warn!(format!("clippy found {} warning(s)", summary.warnings));
-    } else if summary.is_clean() {
-        buckal_log!("Finished", "clippy found no issues");
     }
 }
 
