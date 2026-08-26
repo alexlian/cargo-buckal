@@ -50,6 +50,19 @@ pub(super) fn patch_root_windows_rustc_flags(
         }
     }
 
+    // Per-binary unit-test rules need the import-lib flags for the same reason
+    // the binaries do — they link the same crate graph. Keep this in step with
+    // the `<bin>-unittest` rules emitted in `rules.rs`.
+    for bin_target in root
+        .targets
+        .iter()
+        .filter(|t| t.kind.contains(&TargetKind::Bin))
+    {
+        if bin_target.test {
+            rust_test_names.insert(format!("{}-unittest", bin_target.name));
+        }
+    }
+
     if bin_names.is_empty() && rust_test_names.is_empty() {
         return buck_content;
     }

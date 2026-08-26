@@ -235,12 +235,12 @@ mod tests {
 
     #[test]
     fn cli_run_with_package() {
-        let cli = Cli::try_parse_from(["cargo", "buckal", "run", "-p", "mm_cli"])
+        let cli = Cli::try_parse_from(["cargo", "buckal", "run", "-p", "alpha"])
             .expect("failed to parse run -p args");
         match cli.command {
             Commands::Buckal(args) => match args.subcommands {
                 Some(BuckalSubCommands::Run(run_args)) => {
-                    assert_eq!(run_args.package.as_deref(), Some("mm_cli"));
+                    assert_eq!(run_args.package.as_deref(), Some("alpha"));
                 }
                 other => panic!("expected run subcommand, got {other:?}"),
             },

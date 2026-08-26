@@ -205,12 +205,12 @@ mod tests {
 
     #[test]
     fn cli_build_accepts_package_short_and_long() {
-        let args = build_args(&["cargo", "buckal", "build", "-p", "mm_core"]);
-        assert_eq!(args.package, vec!["mm_core"]);
+        let args = build_args(&["cargo", "buckal", "build", "-p", "alpha"]);
+        assert_eq!(args.package, vec!["alpha"]);
         assert!(!args.workspace);
 
-        let args = build_args(&["cargo", "buckal", "build", "--package", "mm_core"]);
-        assert_eq!(args.package, vec!["mm_core"]);
+        let args = build_args(&["cargo", "buckal", "build", "--package", "alpha"]);
+        assert_eq!(args.package, vec!["alpha"]);
     }
 
     #[test]
@@ -240,9 +240,9 @@ mod tests {
             "build",
             "--workspace",
             "--exclude",
-            "mm_ai",
+            "beta",
         ]);
         assert!(args.workspace);
-        assert_eq!(args.exclude, vec!["mm_ai"]);
+        assert_eq!(args.exclude, vec!["beta"]);
     }
 }

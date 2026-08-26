@@ -301,12 +301,12 @@ mod tests {
 
     #[test]
     fn cli_clippy_accepts_package_and_workspace() {
-        let cli = Cli::try_parse_from(["cargo", "buckal", "clippy", "-p", "mm_ai", "--workspace"])
+        let cli = Cli::try_parse_from(["cargo", "buckal", "clippy", "-p", "beta", "--workspace"])
             .expect("failed to parse clippy -p --workspace");
         match cli.command {
             Commands::Buckal(args) => match args.subcommands {
                 Some(BuckalSubCommands::Clippy(clippy_args)) => {
-                    assert_eq!(clippy_args.package, vec!["mm_ai"]);
+                    assert_eq!(clippy_args.package, vec!["beta"]);
                     assert!(clippy_args.workspace);
                 }
                 other => panic!("expected clippy subcommand, got {other:?}"),

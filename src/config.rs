@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    buckal_warn,
+    buckal_error, buckal_note,
     utils::{UnwrapOrExit, get_buck2_root},
 };
 
@@ -160,10 +160,17 @@ fn set_permissions(_file: &File) -> Result<()> {
     Ok(())
 }
 
+/// Repo-local settings, read from `buckal.toml` at the Buck2 project root.
+///
+/// `deny_unknown_fields` is load-bearing rather than tidiness. Every field
+/// here has a default, and the default for `ignore_tests` is `true` -- so a
+/// key that fails to bind does not degrade, it silently switches test-target
+/// generation off and `rust_test` rules vanish from every BUCK file. A
+/// singular `ignore_test`, or settings nested under a `[repo]` section that
+/// does not exist, both used to parse cleanly and do exactly that.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct RepoConfig {
-    pub align_cells: bool,
     pub ignore_tests: bool,
     pub patch_fields: Set<String>,
     pub patch: RepoPatchConfig,
@@ -172,7 +179,6 @@ pub struct RepoConfig {
 impl Default for RepoConfig {
     fn default() -> Self {
         Self {
-            align_cells: false,
             ignore_tests: true,
             patch_fields: Set::new(),
             patch: RepoPatchConfig::default(),
@@ -201,25 +207,29 @@ impl RepoConfig {
             return Self::default();
         }
 
-        match fs::read_to_string(&repo_config_path) {
-            Ok(content) => match toml::from_str::<RepoConfig>(&content) {
-                Ok(config) => config,
-                Err(_) => {
-                    buckal_warn!(
-                        "Failed to parse repo config file at {}, using defaults",
-                        repo_config_path.display()
-                    );
-                    Self::default()
-                }
-            },
-            Err(_) => {
-                buckal_warn!(
-                    "Failed to read repo config file at {}, using defaults",
-                    repo_config_path.display()
-                );
-                Self::default()
-            }
-        }
+        // A file that exists but cannot be honoured is an error, not a
+        // fallback. Continuing on defaults would generate a BUCK graph that
+        // ignores what the repo asked for -- and since `ignore_tests` defaults
+        // to `true`, the most likely shape of that is a graph with no test
+        // rules at all, produced with a single warning that scrolls past.
+        let content = fs::read_to_string(&repo_config_path).unwrap_or_else(|e| {
+            buckal_error!(format!(
+                "failed to read `{}`: {e}",
+                repo_config_path.display()
+            ));
+            std::process::exit(1);
+        });
+
+        toml::from_str::<RepoConfig>(&content).unwrap_or_else(|e| {
+            buckal_error!(format!(
+                "failed to parse `{}`: {e}",
+                repo_config_path.display()
+            ));
+            buckal_note!(
+                "supported keys are `ignore_tests`, `patch_fields` and `[patch.version]`, all at the file root"
+            );
+            std::process::exit(1);
+        })
     }
 
     pub fn repo_config_path() -> PathBuf {
@@ -231,6 +241,49 @@ impl RepoConfig {
 #[cfg(test)]
 mod tests {
     use super::RepoConfig;
+
+    /// A key that does not bind must not be shrugged off: `ignore_tests`
+    /// defaults to `true`, so a typo silently removes every `rust_test` rule.
+    #[test]
+    fn test_repo_config_rejects_a_misspelled_key() {
+        let err = toml::from_str::<RepoConfig>("ignore_test = false\n")
+            .expect_err("a misspelled key must not parse");
+
+        assert!(
+            err.to_string().contains("ignore_test"),
+            "the error should name the offending key, got: {err}"
+        );
+    }
+
+    /// The shape both known consumers warn about in a hand-written comment:
+    /// settings nested under a `[repo]` section that has never existed.
+    #[test]
+    fn test_repo_config_rejects_a_nonexistent_section() {
+        let err = toml::from_str::<RepoConfig>("[repo]\nignore_tests = false\n")
+            .expect_err("an unknown section must not parse");
+
+        assert!(
+            err.to_string().contains("repo"),
+            "the error should name the offending section, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_repo_config_still_accepts_every_supported_key() {
+        let config: RepoConfig = toml::from_str(
+            r#"
+                ignore_tests = false
+                patch_fields = ["env"]
+
+                [patch.version]
+                pyo3 = { from = "0.26.0", to = "0.27.2" }
+            "#,
+        )
+        .expect("the documented keys must keep parsing");
+
+        assert!(!config.ignore_tests);
+        assert!(config.patch_fields.contains("env"));
+    }
 
     #[test]
     fn test_repo_config_deserializes_version_patch() {

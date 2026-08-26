@@ -6,7 +6,7 @@ use crate::{
     RUST_CRATES_ROOT, RUST_GIT_ROOT,
     assets::{extract_buck2_assets, upgrade_platform_assets},
     buck2::Buck2Command,
-    buckal_error, buckal_log,
+    buckal_error, buckal_log, buckal_note,
     bundles::{fetch_buckal_cell, init_buckal_cell, init_modifier},
     cache::BuckalCache,
     context::BuckalContext,
@@ -128,6 +128,16 @@ pub fn execute(args: &MigrateArgs) {
     // get cargo metadata and generate context
     let mut ctx = BuckalContext::new(args.manifest_path.clone());
     ctx.no_merge = !args.merge;
+
+    // `ignore_tests` defaults to true, so the common case is a repo that never
+    // asked for this and gets a BUCK graph with no `rust_test` rules in it.
+    // Nothing said so, which made "cargo buckal test finds nothing" a puzzle
+    // rather than a setting. One line at the point of generation is enough.
+    if ctx.repo_config.ignore_tests {
+        buckal_note!(
+            "skipping test targets (`ignore_tests` is true; set `ignore_tests = false` in `buckal.toml` to generate them)"
+        );
+    }
 
     // Process dep nodes
     // For migrate, a missing cache means "first run" — use empty so everything is

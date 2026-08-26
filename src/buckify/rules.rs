@@ -147,6 +147,36 @@ pub fn buckify_root_node(node: &BuckalNode, ctx: &BuckalContext) -> Vec<Rule> {
         }
 
         buck_rules.push(Rule::RustBinary(rust_binary));
+
+        // A binary's `#[cfg(test)]` modules are compiled only under `--test`.
+        // Without a `rust_test` rooted at the binary's own crate root, nothing
+        // in the graph builds them and nothing runs them — `cargo buckal test`
+        // then reports green over tests that were never compiled, which is
+        // worse than not having them.
+        //
+        // `test` here is Cargo's per-target flag (true for a binary unless the
+        // manifest sets `test = false`), not "this file contains tests" — the
+        // same basis the library's `unittest` rule uses just below. A binary
+        // with no test modules gets a target that runs zero tests, exactly as
+        // `cargo test --bin <name>` does.
+        if !ctx.repo_config.ignore_tests && bin_target.test {
+            let mut rust_test = emit_rust_test(
+                node,
+                bin_target,
+                &manifest_dir,
+                &format!("{buckal_name}-unittest"),
+                ctx,
+            );
+
+            // Same reasoning as the binary above: the test compiles the
+            // binary's crate root, which reaches the package library by the
+            // crate's own name.
+            if let Some(lib_name) = &lib_buck_name {
+                rust_test.deps_mut().insert(format!(":{lib_name}"));
+            }
+
+            buck_rules.push(Rule::RustTest(rust_test));
+        }
     }
 
     // emit buck rules for lib targets
@@ -457,6 +487,105 @@ mod tests {
 
         assert!(lib_rule.is_some());
         assert_eq!(lib_rule.unwrap().name, "foo-lib");
+    }
+
+    fn ctx_with(ignore_tests: bool) -> BuckalContext {
+        BuckalContext {
+            root: None,
+            resolve: empty_resolve(),
+            repo_config: RepoConfig {
+                ignore_tests,
+                ..RepoConfig::default()
+            },
+            workspace_root: Utf8PathBuf::from("/tmp"),
+            workspace_inherit: false,
+            no_merge: false,
+        }
+    }
+
+    fn test_rule_names(rules: &[Rule]) -> Vec<String> {
+        rules
+            .iter()
+            .filter_map(|r| match r {
+                Rule::RustTest(t) => Some(t.name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A binary's `#[cfg(test)]` modules compile only under `--test`, so
+    /// without a rule rooted at the binary they are built by nothing and the
+    /// suite reports green over them.
+    #[test]
+    fn bin_targets_get_their_own_unittest_rule() {
+        let node = mock_node(
+            "foo",
+            vec![
+                mock_target("foo", TargetKind::Lib),
+                mock_target("helper", TargetKind::Bin),
+            ],
+        );
+
+        let rules = buckify_root_node(&node, &ctx_with(false));
+        let names = test_rule_names(&rules);
+
+        // The library keeps its bare `unittest`; the binary gets its own.
+        assert!(names.contains(&"unittest".to_string()), "{names:?}");
+        assert!(names.contains(&"helper-unittest".to_string()), "{names:?}");
+    }
+
+    /// The rule must compile the *binary's* crate root, not the library's --
+    /// that is the whole point -- and reach the sibling library the same way
+    /// the `rust_binary` does.
+    #[test]
+    fn bin_unittest_is_rooted_at_the_bin_and_links_the_lib() {
+        let mut bin = mock_target("helper", TargetKind::Bin);
+        bin.src_path = Utf8PathBuf::from("/tmp/src/bin/helper.rs");
+
+        let node = mock_node("foo", vec![mock_target("foo", TargetKind::Lib), bin]);
+
+        let rules = buckify_root_node(&node, &ctx_with(false));
+        let rule = rules
+            .iter()
+            .find_map(|r| match r {
+                Rule::RustTest(t) if t.name == "helper-unittest" => Some(t),
+                _ => None,
+            })
+            .expect("expected a helper-unittest rule");
+
+        assert!(
+            rule.crate_root.ends_with("src/bin/helper.rs"),
+            "crate_root was {}",
+            rule.crate_root
+        );
+        assert!(rule.deps.contains(":foo"), "deps were {:?}", rule.deps);
+    }
+
+    #[test]
+    fn bin_unittest_is_suppressed_when_the_target_opts_out_of_test() {
+        let mut bin = mock_target("helper", TargetKind::Bin);
+        bin.test = false;
+
+        let node = mock_node("foo", vec![mock_target("foo", TargetKind::Lib), bin]);
+
+        let names = test_rule_names(&buckify_root_node(&node, &ctx_with(false)));
+
+        assert!(!names.contains(&"helper-unittest".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn bin_unittest_is_suppressed_by_ignore_tests() {
+        let node = mock_node(
+            "foo",
+            vec![
+                mock_target("foo", TargetKind::Lib),
+                mock_target("helper", TargetKind::Bin),
+            ],
+        );
+
+        let names = test_rule_names(&buckify_root_node(&node, &ctx_with(true)));
+
+        assert!(names.is_empty(), "{names:?}");
     }
 
     #[test]

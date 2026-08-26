@@ -88,7 +88,10 @@ pub fn narrowing_disabled() -> bool {
 /// rather than overwrite.
 fn parse_tree(stdout: &str, into: &mut PlatformFeatures) {
     for raw in stdout.lines() {
-        let line = raw.trim_end().strip_suffix(" (*)").unwrap_or(raw.trim_end());
+        let line = raw
+            .trim_end()
+            .strip_suffix(" (*)")
+            .unwrap_or(raw.trim_end());
         let Some((spec, feats)) = line.rsplit_once('|') else {
             continue;
         };
@@ -106,7 +109,12 @@ fn parse_tree(stdout: &str, into: &mut PlatformFeatures) {
         let entry = into
             .entry((name.to_string(), version.to_string()))
             .or_default();
-        entry.extend(feats.split(',').filter(|f| !f.is_empty()).map(str::to_string));
+        entry.extend(
+            feats
+                .split(',')
+                .filter(|f| !f.is_empty())
+                .map(str::to_string),
+        );
     }
 }
 
@@ -143,7 +151,11 @@ fn cargo_tree(triple: &str, manifest_path: Option<&str>) -> Option<String> {
             None
         }
         Err(error) => {
-            buckal_warn!("failed to execute `cargo tree --target {}`: {}", triple, error);
+            buckal_warn!(
+                "failed to execute `cargo tree --target {}`: {}",
+                triple,
+                error
+            );
             None
         }
     }
@@ -201,13 +213,18 @@ pub fn pinned_to_union(
     platform_features: &PlatformFeatures,
 ) -> HashSet<PackageId> {
     let unreachable = |id: &PackageId| match packages_map.get(id) {
-        Some(pkg) => !platform_features
-            .contains_key(&(pkg.name.to_string(), pkg.version.to_string())),
+        Some(pkg) => {
+            !platform_features.contains_key(&(pkg.name.to_string(), pkg.version.to_string()))
+        }
         None => true,
     };
 
     let mut pinned = HashSet::new();
-    let mut queue: Vec<PackageId> = nodes_map.keys().filter(|id| unreachable(id)).cloned().collect();
+    let mut queue: Vec<PackageId> = nodes_map
+        .keys()
+        .filter(|id| unreachable(id))
+        .cloned()
+        .collect();
     while let Some(id) = queue.pop() {
         let Some(node) = nodes_map.get(&id) else {
             continue;
@@ -242,9 +259,9 @@ mod tests {
 
     #[test]
     fn ignores_a_source_suffix() {
-        let out = parse("mm_server v0.1.0 (/home/x/src/mm_server)|default,http\n");
+        let out = parse("gamma v0.1.0 (/home/x/src/gamma)|default,http\n");
         assert_eq!(
-            out[&("mm_server".to_string(), "0.1.0".to_string())],
+            out[&("gamma".to_string(), "0.1.0".to_string())],
             BTreeSet::from(["default".to_string(), "http".to_string()])
         );
     }
