@@ -312,39 +312,109 @@ impl BuckTargetEntry {
     }
 }
 
+/// What one `buck2 targets` sweep tells a command.
+#[derive(Debug, Default)]
+pub struct TargetScan {
+    /// Buildable first-party Rust targets under the requested packages.
+    pub targets: Vec<BuckTargetEntry>,
+    /// Whether the platform label passed to [`scan_targets_in`] names a target
+    /// that exists. Always `false` when no platform was asked about.
+    pub platform_exists: bool,
+}
+
+/// Strip the cell name so `root//platforms:x` and `//platforms:x` compare equal.
+fn cell_relative(label: &str) -> &str {
+    match label.find("//") {
+        Some(index) => &label[index..],
+        None => label,
+    }
+}
+
 /// Get available targets from Buck2 under the specified package, and filter out non-Rust rules and third-party rules.
 pub fn get_available_targets(package: &str) -> anyhow::Result<Vec<BuckTargetEntry>> {
-    get_available_targets_in(&[package.to_string()])
+    Ok(scan_targets_in(&[package.to_string()], None)?.targets)
 }
 
 /// Like [`get_available_targets`], but queries several packages in a single
 /// `buck2 targets` invocation. Each entry is a Buck-relative package path
 /// (forward slashes); an empty entry means "the whole project" (`//...`).
 pub fn get_available_targets_in(packages: &[String]) -> anyhow::Result<Vec<BuckTargetEntry>> {
-    if packages.is_empty() {
-        return Ok(Vec::new());
-    }
+    Ok(scan_targets_in(packages, None)?.targets)
+}
 
-    let patterns: Vec<String> = if packages.iter().any(|p| p.is_empty()) {
+/// Enumerate targets and, in the same invocation, settle whether `platform`
+/// exists.
+///
+/// The existence question used to cost its own `buck2 uquery` — measured at
+/// ~190ms against a warm daemon, on the default path of every `build`,
+/// `check`, `clippy`, `test` and `run`. Buck2 serializes commands per daemon,
+/// so it could not be overlapped either; folding it into the enumeration that
+/// already runs is the only way to stop paying for it.
+///
+/// Naming a non-existent target fails the whole query, so a failure with the
+/// platform included is retried without it. That costs two invocations in the
+/// case that used to cost two anyway — a repo with no such platform — and one
+/// everywhere else.
+pub fn scan_targets_in(packages: &[String], platform: Option<&str>) -> anyhow::Result<TargetScan> {
+    let package_patterns: Vec<String> = if packages.is_empty() {
+        Vec::new()
+    } else if packages.iter().any(|p| p.is_empty()) {
         // A `//...` query subsumes every package-scoped pattern.
         vec!["//...".to_string()]
     } else {
         packages.iter().map(|p| format!("//{p}/...")).collect()
     };
 
+    if package_patterns.is_empty() && platform.is_none() {
+        return Ok(TargetScan::default());
+    }
+
+    if let Some(platform) = platform {
+        let mut patterns = package_patterns.clone();
+        patterns.push(platform.to_owned());
+
+        // A miss here is the expected "this repo has no such platform" case,
+        // not an error to report.
+        if let Ok(entries) = query_targets(&patterns) {
+            let platform_exists = entries
+                .iter()
+                .any(|entry| cell_relative(&entry.label()) == cell_relative(platform));
+            return Ok(TargetScan {
+                targets: keep_buildable(entries),
+                platform_exists,
+            });
+        }
+    }
+
+    if package_patterns.is_empty() {
+        return Ok(TargetScan::default());
+    }
+
+    Ok(TargetScan {
+        targets: keep_buildable(query_targets(&package_patterns)?),
+        platform_exists: false,
+    })
+}
+
+fn keep_buildable(entries: Vec<BuckTargetEntry>) -> Vec<BuckTargetEntry> {
+    entries
+        .into_iter()
+        .filter(|entry| entry.is_rust_rule() && !entry.is_third_party())
+        .collect()
+}
+
+fn query_targets(patterns: &[String]) -> anyhow::Result<Vec<BuckTargetEntry>> {
     let mut cmd = Buck2Command::targets();
-    for pattern in &patterns {
+    for pattern in patterns {
         cmd = cmd.arg(pattern);
     }
 
     match cmd.arg("--output-basic-attributes").arg("--json").output() {
         Ok(output) => {
             if output.status.success() {
-                let targets = serde_json::from_slice::<Vec<BuckTargetEntry>>(&output.stdout)?
-                    .into_iter()
-                    .filter(|entry| entry.is_rust_rule() && !entry.is_third_party())
-                    .collect();
-                Ok(targets)
+                Ok(serde_json::from_slice::<Vec<BuckTargetEntry>>(
+                    &output.stdout,
+                )?)
             } else {
                 bail!(
                     "failed to query Buck2 targets: {}",
