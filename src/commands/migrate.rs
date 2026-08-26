@@ -115,9 +115,12 @@ pub fn execute(args: &MigrateArgs) {
     // `platform()` for lowers to an unreachable `select()` branch and is
     // dropped from the build with no diagnostic. Additive, so hand-edits stay.
     if let Ok(buck2_root) = get_buck2_root() {
-        let added = upgrade_platform_assets(buck2_root.as_std_path())
+        let upgrade = upgrade_platform_assets(buck2_root.as_std_path())
             .unwrap_or_exit_ctx("failed to upgrade platform definitions");
-        for name in &added {
+        for path in &upgrade.files {
+            buckal_log!("Adding", path);
+        }
+        for name in &upgrade.platforms {
             buckal_log!("Adding", format!("//platforms:{name}"));
         }
     }

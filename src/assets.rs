@@ -69,23 +69,68 @@ fn platform_blocks(contents: &str) -> Vec<(String, String)> {
     blocks
 }
 
-/// Add every `platform()` target the embedded template declares that `dest`'s
-/// `platforms/BUCK` is missing, and return the names added in template order.
+/// What an upgrade added, for the caller to report.
+#[derive(Debug, Default)]
+pub struct PlatformUpgrade {
+    /// Names of `platform()` targets appended to `platforms/BUCK`.
+    pub platforms: Vec<String>,
+    /// Paths, relative to the project root, of asset files newly written.
+    pub files: Vec<String>,
+}
+
+impl PlatformUpgrade {
+    pub fn is_empty(&self) -> bool {
+        self.platforms.is_empty() && self.files.is_empty()
+    }
+}
+
+/// Bring an already-generated `platforms/` directory up to date with this
+/// build's embedded assets, and report what changed.
 ///
-/// This is additive on purpose. A `platforms/BUCK` is generated but routinely
-/// hand-extended (extra `config_setting`s, comments), so rewriting it would
-/// cost more than the drift it fixes. What it must not be missing is a
-/// `platform()` for a supported (os, cpu) pair: `os_deps` keyed to that pair
-/// lowers to a `select()` branch nothing can match, and the dependencies in it
-/// are dropped from the build with no diagnostic. See `docs/multi-platform.md`
-/// and `//platforms/verify_deps.bxl:check`.
+/// Two kinds of drift, both repaired additively:
+///
+/// - **Missing asset files** are written. `extract_buck2_assets` only ever runs
+///   under `migrate --init`, so a file added to `assets/platforms/` after a repo
+///   was generated would otherwise never reach it — which is the whole
+///   population that needs `verify_deps.bxl`. Only absent files are created;
+///   an existing one is left alone, edits and all.
+/// - **Missing `platform()` targets** are appended to `platforms/BUCK`. A
+///   `platforms/BUCK` is generated but routinely hand-extended (extra
+///   `config_setting`s, comments), so rewriting it would cost more than the
+///   drift it fixes. What it must not be missing is a `platform()` for a
+///   supported (os, cpu) pair: `os_deps` keyed to that pair lowers to a
+///   `select()` branch nothing can match, and the dependencies in it are
+///   dropped from the build with no diagnostic. See `docs/multi-platform.md`.
 ///
 /// A repo with no `platforms/` directory is left alone — creating one is
 /// `migrate --init`'s job, not an upgrade's.
-pub fn upgrade_platform_assets(dest: &Path) -> io::Result<Vec<String>> {
-    let buck_file = dest.join("platforms").join("BUCK");
+pub fn upgrade_platform_assets(dest: &Path) -> io::Result<PlatformUpgrade> {
+    let platforms_root = dest.join("platforms");
+    let buck_file = platforms_root.join("BUCK");
     if !buck_file.is_file() {
-        return Ok(Vec::new());
+        return Ok(PlatformUpgrade::default());
+    }
+
+    let mut upgrade = PlatformUpgrade::default();
+
+    // Asset files the repo predates. `BUCK.template` is excluded: it is not
+    // copied verbatim but merged block-by-block below.
+    for file in PLATFORMS_ASSET.files() {
+        let name = file.path();
+        if name.file_name() == Some(std::ffi::OsStr::new("BUCK.template")) {
+            continue;
+        }
+        let target = platforms_root.join(name);
+        if target.exists() {
+            continue;
+        }
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&target, normalize_line_endings(file.contents()))?;
+        upgrade
+            .files
+            .push(format!("platforms/{}", name.display()).replace('\\', "/"));
     }
 
     let template = PLATFORMS_ASSET
@@ -100,7 +145,6 @@ pub fn upgrade_platform_assets(dest: &Path) -> io::Result<Vec<String>> {
         .map(|(name, _)| name)
         .collect();
 
-    let mut added = Vec::new();
     let mut appended = String::new();
     for (name, block) in platform_blocks(&template) {
         if have.contains(&name) {
@@ -108,21 +152,19 @@ pub fn upgrade_platform_assets(dest: &Path) -> io::Result<Vec<String>> {
         }
         appended.push('\n');
         appended.push_str(&block);
-        added.push(name);
+        upgrade.platforms.push(name);
     }
 
-    if added.is_empty() {
-        return Ok(added);
+    if !upgrade.platforms.is_empty() {
+        let mut updated = existing;
+        if !updated.ends_with('\n') {
+            updated.push('\n');
+        }
+        updated.push_str(&appended);
+        std::fs::write(&buck_file, updated)?;
     }
 
-    let mut updated = existing;
-    if !updated.ends_with('\n') {
-        updated.push('\n');
-    }
-    updated.push_str(&appended);
-    std::fs::write(&buck_file, updated)?;
-
-    Ok(added)
+    Ok(upgrade)
 }
 
 fn extract_dir(dest: &Path, dir: &Dir) -> io::Result<()> {
@@ -252,7 +294,7 @@ config_setting(
         let added = upgrade_platform_assets(dest.path()).expect("upgrade failed");
 
         assert_eq!(
-            added,
+            added.platforms,
             vec!["x86_64-apple-darwin", "aarch64-pc-windows-msvc"]
         );
 
@@ -270,6 +312,44 @@ config_setting(
         ] {
             assert!(names.contains(&triple.to_string()), "missing {triple}");
         }
+    }
+
+    /// `extract_buck2_assets` runs only under `migrate --init`, so an asset
+    /// added after a repo was generated reaches it through the upgrade or not
+    /// at all — and the repos that predate `verify_deps.bxl` are exactly the
+    /// ones whose platform coverage it exists to check.
+    #[test]
+    fn upgrade_delivers_asset_files_the_repo_predates() {
+        let dest = legacy_repo();
+        let bxl = dest.path().join("platforms").join("verify_deps.bxl");
+        assert!(!bxl.exists(), "fixture should not start with the .bxl");
+
+        let added = upgrade_platform_assets(dest.path()).expect("upgrade failed");
+
+        assert_eq!(added.files, vec!["platforms/verify_deps.bxl"]);
+        assert!(bxl.is_file());
+        assert!(
+            std::fs::read_to_string(&bxl)
+                .expect("read bxl")
+                .contains("_EXPECTED_PLATFORMS")
+        );
+    }
+
+    /// Delivery must not become a rewrite: an asset the user has edited is
+    /// theirs, and the upgrade only ever fills in what is absent.
+    #[test]
+    fn upgrade_never_overwrites_an_existing_asset_file() {
+        let dest = legacy_repo();
+        let bxl = dest.path().join("platforms").join("verify_deps.bxl");
+        std::fs::write(&bxl, "# locally modified\n").expect("seed bxl");
+
+        let added = upgrade_platform_assets(dest.path()).expect("upgrade failed");
+
+        assert!(added.files.is_empty());
+        assert_eq!(
+            std::fs::read_to_string(&bxl).expect("read bxl"),
+            "# locally modified\n"
+        );
     }
 
     /// The upgrade appends; it must not disturb a line the user wrote.
