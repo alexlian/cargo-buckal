@@ -72,6 +72,8 @@ impl BuckalChange {
                             buck_content =
                                 windows::patch_root_windows_rustc_flags(buck_content, ctx, node);
                         }
+                        buck_content =
+                            windows::patch_buildscript_windows_rustc_flags(buck_content, ctx, node);
                         buck_content = cross::patch_rust_test_target_compatible_with(buck_content);
                         std::fs::write(&buck_path, buck_content)
                             .expect("Failed to write BUCK file");

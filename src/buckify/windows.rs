@@ -6,11 +6,24 @@ use starlark_syntax::syntax::ast::{
 };
 use starlark_syntax::syntax::{AstModule, Dialect};
 
-use cargo_metadata::TargetKind;
+use cargo_metadata::{DependencyKind, TargetKind};
 
 use crate::context::BuckalContext;
 use crate::resolve::{BuckalNode, is_lib_like};
 use crate::utils::{UnwrapOrExit, get_vendor_path_relative};
+
+/// The rule name buckal gives a package's build-script executable.
+const BUILD_SCRIPT_BINARY: &str = "build-script-build";
+
+/// Crates whose build script is the *source* of an import-library search path:
+/// they ship a prebuilt `.lib` and print `cargo:rustc-link-search=native=...`
+/// for it. Their own build-script binaries must never be patched — the flags
+/// would come from the very `build-script-run` that the binary feeds.
+const IMPORT_LIB_PROVIDERS: [&str; 3] = [
+    "winapi-x86_64-pc-windows-gnu",
+    "windows_x86_64_gnu",
+    "windows_x86_64_msvc",
+];
 
 #[derive(Default)]
 struct WindowsImportLibFlags {
@@ -78,6 +91,63 @@ pub(super) fn patch_root_windows_rustc_flags(
     }
 
     buck_content
+}
+
+/// Give a package's build-script executable the same import-library search
+/// paths its binaries and tests get.
+///
+/// A `build-script-build` target is an ordinary `rust_binary`: it links, and it
+/// links the *build-dependency* closure. When something in that closure reaches
+/// a crate that ships a prebuilt import library (`windows-sys 0.52` ->
+/// `windows-targets` -> `windows_x86_64_msvc`, say), the `#[link(name =
+/// "windows.0.52.0")]` the macro expands into the build script needs a
+/// `/LIBPATH:` pointing at the shipped `lib/` directory, exactly as a runtime
+/// link does. Without it the build script compiles and fails to link
+/// (`LNK1181: cannot open input file 'windows.0.52.0.lib'`), which is invisible
+/// from any seat that does not link on Windows.
+///
+/// Unlike [`patch_root_windows_rustc_flags`] this runs for third-party packages
+/// too — the exposure is a property of what is under `[build-dependencies]`,
+/// not of who owns the crate.
+pub(super) fn patch_buildscript_windows_rustc_flags(
+    buck_content: String,
+    ctx: &BuckalContext,
+    node: &BuckalNode,
+) -> String {
+    if !should_patch_buildscript(&node.name, has_build_dependencies(ctx, node)) {
+        return buck_content;
+    }
+
+    let flags = windows_import_lib_flags(ctx);
+    let select_expr = render_windows_rustc_flags_select(&flags);
+    if select_expr.is_empty() {
+        return buck_content;
+    }
+
+    apply_rustc_flags_patch_to_content(
+        &buck_content,
+        "rust_binary",
+        BUILD_SCRIPT_BINARY,
+        &select_expr,
+    )
+}
+
+/// A build script that has no `[build-dependencies]` cannot have inherited a
+/// link search from one, so leave its rule alone rather than churn every
+/// vendored BUCK that happens to carry a `build.rs`.
+fn should_patch_buildscript(package_name: &str, has_build_deps: bool) -> bool {
+    has_build_deps && !IMPORT_LIB_PROVIDERS.contains(&package_name)
+}
+
+fn has_build_dependencies(ctx: &BuckalContext, node: &BuckalNode) -> bool {
+    ctx.resolve
+        .deps_of(&node.package_id)
+        .iter()
+        .any(|(dep, _)| {
+            dep.dep_kinds
+                .iter()
+                .any(|k| k.kind == DependencyKind::Build)
+        })
 }
 
 fn windows_import_lib_flags(ctx: &BuckalContext) -> WindowsImportLibFlags {
@@ -432,6 +502,64 @@ mod tests {
             "select({\"DEFAULT\": []})",
         );
         assert_eq!(patched, expected);
+    }
+
+    #[test]
+    fn apply_rustc_flags_patch_to_content_patches_the_build_script_binary() {
+        let input = indoc! {r#"
+            rust_library(
+                name = "mm_proto",
+                rustc_flags = [
+                    "@$(location :build-script-run[rustc_flags])",
+                ],
+            )
+
+            rust_binary(
+                name = "build-script-build",
+                rustc_flags = [
+                    "@$(location :manifest[env_flags])",
+                ],
+            )
+            "#};
+
+        let expected = indoc! {r#"
+            rust_library(
+                name = "mm_proto",
+                rustc_flags = [
+                    "@$(location :build-script-run[rustc_flags])",
+                ],
+            )
+
+            rust_binary(
+                name = "build-script-build",
+                rustc_flags = [
+                    "@$(location :manifest[env_flags])",
+                ] + select({"DEFAULT": []}),
+            )
+            "#};
+
+        let patched = apply_rustc_flags_patch_to_content(
+            input,
+            "rust_binary",
+            BUILD_SCRIPT_BINARY,
+            "select({\"DEFAULT\": []})",
+        );
+        assert_eq!(patched, expected);
+    }
+
+    #[test]
+    fn should_patch_buildscript_requires_build_dependencies() {
+        assert!(should_patch_buildscript("mm_proto", true));
+        // A `build.rs` with nothing under `[build-dependencies]` links only
+        // std, so there is no inherited link search to lose.
+        assert!(!should_patch_buildscript("mm_proto", false));
+    }
+
+    #[test]
+    fn should_patch_buildscript_skips_the_import_lib_providers() {
+        for provider in IMPORT_LIB_PROVIDERS {
+            assert!(!should_patch_buildscript(provider, true));
+        }
     }
 
     #[test]
