@@ -647,4 +647,89 @@ mod tests {
         );
         assert_eq!(patched, expected);
     }
+
+    /// The gate reads the dependency graph, not the manifest text: only a
+    /// `[build-dependencies]` edge puts a crate in the build script's link.
+    /// A normal dependency reaches the library, never the build script.
+    #[test]
+    fn has_build_dependencies_distinguishes_edge_kinds() {
+        use cargo_metadata::{DependencyKind, Edition, PackageId};
+        use daggy::Dag;
+        use std::collections::HashMap;
+
+        use crate::config::RepoConfig;
+        use crate::resolve::{BuckalDep, BuckalDepKind, BuckalResolve, NodeKind};
+
+        fn node(name: &str) -> BuckalNode {
+            BuckalNode {
+                package_id: PackageId {
+                    repr: format!("path+file://{name}#0.1.0"),
+                },
+                name: name.to_owned(),
+                version: "0.1.0".to_owned(),
+                features: vec![],
+                kind: NodeKind::FirstParty {
+                    relative_path: String::new(),
+                },
+                edition: Edition::E2021,
+                manifest_path: "/tmp/Cargo.toml".into(),
+                targets: vec![],
+                source: None,
+                links: None,
+                checksum: None,
+            }
+        }
+
+        fn ctx_with_edge(kind: DependencyKind) -> (BuckalContext, BuckalNode) {
+            let root = node("root");
+            let dep = node("dep");
+            let root_id = root.package_id.clone();
+            let dep_id = dep.package_id.clone();
+
+            let mut dag = Dag::new();
+            let root_idx = dag.add_node(root.clone());
+            let dep_idx = dag.add_node(dep);
+            dag.add_edge(
+                root_idx,
+                dep_idx,
+                BuckalDep {
+                    name: "dep".to_owned(),
+                    dep_kinds: vec![BuckalDepKind { kind, target: None }],
+                },
+            )
+            .expect("edge");
+
+            let mut index_map = HashMap::new();
+            index_map.insert(root_id.clone(), root_idx);
+            index_map.insert(dep_id, dep_idx);
+
+            let ctx = BuckalContext {
+                root: Some(root_id),
+                resolve: BuckalResolve { dag, index_map },
+                workspace_root: "/tmp".into(),
+                workspace_inherit: false,
+                no_merge: false,
+                repo_config: RepoConfig::default(),
+            };
+            (ctx, root)
+        }
+
+        let (build_ctx, root) = ctx_with_edge(DependencyKind::Build);
+        assert!(
+            has_build_dependencies(&build_ctx, &root),
+            "a build-dependency edge is what puts a crate in the build script's link"
+        );
+
+        let (normal_ctx, root) = ctx_with_edge(DependencyKind::Normal);
+        assert!(
+            !has_build_dependencies(&normal_ctx, &root),
+            "a normal dependency reaches the library, not the build script"
+        );
+
+        let (dev_ctx, root) = ctx_with_edge(DependencyKind::Development);
+        assert!(
+            !has_build_dependencies(&dev_ctx, &root),
+            "nor does a dev-dependency"
+        );
+    }
 }

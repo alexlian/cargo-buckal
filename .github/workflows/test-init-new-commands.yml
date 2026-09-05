@@ -115,3 +115,48 @@ jobs:
           test -f test-new-lite/toolchains/BUCK
           test -f test-new-lite/platforms/BUCK
           test -f test-new-lite/.buckconfig
+
+      # A build-script executable links its `[build-dependencies]` closure. When
+      # that closure reaches a crate shipping a prebuilt import library, the link
+      # needs the `-L` search path that crate's own build script prints, exactly
+      # as a runtime link does. Without it the build script compiles and fails to
+      # link, and `cargo buckal check` cannot catch it because it does not link.
+      #
+      # Windows-only: the failure is a linker error against a `.lib` that exists
+      # on no other platform.
+      - name: Test a build script that links an import library
+        if: matrix.name == 'windows'
+        shell: bash
+        run: |
+          mkdir -p test-buildscript-link/src && cd test-buildscript-link
+
+          # `windows-sys` is pinned deliberately. 0.52 reaches the system import
+          # libraries through windows_x86_64_msvc, which ships a prebuilt
+          # windows.0.52.0.lib. Later versions go through windows-link and ship
+          # none, so the link would succeed either way and prove nothing.
+          cat > Cargo.toml <<'EOF'
+          [package]
+          name = "test-buildscript-link"
+          version = "0.1.0"
+          edition = "2021"
+
+          [build-dependencies]
+          windows-sys = { version = "=0.52.0", features = ["Win32_Foundation"] }
+          EOF
+
+          cat > build.rs <<'EOF'
+          fn main() {
+              // Forces the build script's own link to resolve a symbol out of
+              // the prebuilt import library.
+              let err = unsafe { windows_sys::Win32::Foundation::GetLastError() };
+              println!("cargo:rustc-env=FIXTURE_LAST_ERROR={err}");
+          }
+          EOF
+
+          echo 'fn main() { println!("built ok"); }' > src/main.rs
+
+          cargo generate-lockfile
+          cargo buckal migrate --init .
+          # Fails `LNK1181: cannot open input file 'windows.0.52.0.lib'` when the
+          # search path does not reach the build script's link.
+          cargo buckal build --all-targets
