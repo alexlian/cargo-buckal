@@ -4,6 +4,7 @@ use cargo_metadata::camino::Utf8Path;
 use serde::ser::{Serialize, SerializeStruct, SerializeTupleStruct, Serializer};
 use serde_derive::Serialize;
 use starlark_syntax::syntax::ast::{ArgumentP, AstExpr, AstNoPayload, AstStmt, ExprP, Stmt};
+use starlark_syntax::syntax::uniplate::Visit;
 use starlark_syntax::syntax::{AstModule, Dialect};
 
 use crate::buckal_error;
@@ -1141,6 +1142,45 @@ pub fn parse_buck_content(content: &str, origin: &str) -> anyhow::Result<Map<Str
     collect_rules(ast.statement(), &mut buck_rules);
 
     Ok(buck_rules)
+}
+
+/// Every identifier referenced anywhere in some BUCK source.
+///
+/// "Is this symbol used?" cannot be answered from top-level call names alone.
+/// A statement may reach an imported name without calling it:
+///
+/// ```starlark
+/// load("@buckal//:wrapper.bzl", "rust_test")
+/// manual_test = rust_test
+/// manual_test(name = "manual")
+/// ```
+///
+/// Here `rust_test` is used as a value, and a file that carries these two
+/// statements without importing it binds `manual_test` to whatever `rust_test`
+/// happens to mean — a different rule, or nothing at all. Over-reporting is
+/// harmless (an unused import binds a name nobody reads); under-reporting
+/// silently changes what a rule is.
+pub fn referenced_identifiers(content: &str, origin: &str) -> anyhow::Result<Set<String>> {
+    let ast = AstModule::parse(origin, content.to_owned(), &Dialect::Extended)
+        .map_err(|e| anyhow::anyhow!("Failed to parse BUCK file: {}", e))?;
+
+    let mut out = Set::new();
+    collect_identifiers(ast.statement(), &mut out);
+    Ok(out)
+}
+
+fn collect_identifiers(stmt: &AstStmt, out: &mut Set<String>) {
+    stmt.visit_children(|visit| match visit {
+        Visit::Stmt(inner) => collect_identifiers(inner, out),
+        Visit::Expr(expr) => collect_expr_identifiers(expr, out),
+    });
+}
+
+fn collect_expr_identifiers(expr: &AstExpr, out: &mut Set<String>) {
+    if let ExprP::Identifier(ident) = &expr.node {
+        out.insert(ident.node.ident.clone());
+    }
+    expr.visit_expr(|child| collect_expr_identifiers(child, out));
 }
 
 /// The generated region of a BUCK file — everything above the manual marker.

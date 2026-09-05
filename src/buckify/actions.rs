@@ -4,7 +4,7 @@ use regex::Regex;
 use crate::{
     buck::{
         MANUAL_SECTION_MARKER, Rule, generated_region, parse_buck_content, parse_buck_file,
-        parse_buck_statements, patch_buck_rules, split_manual_section,
+        parse_buck_statements, patch_buck_rules, referenced_identifiers, split_manual_section,
     },
     buckal_error, buckal_log, buckal_warn,
     buckify::emit::emit_export_file,
@@ -136,6 +136,7 @@ impl BuckalChange {
             } else {
                 String::new()
             };
+            let had_marker = split_manual_section(&content).is_some();
             let manual = split_manual_section(&content)
                 .map(|manual| manual.trim().to_owned())
                 .unwrap_or_default();
@@ -146,6 +147,9 @@ impl BuckalChange {
                 parse_buck_content(generated_region(&content), buck_path.as_str())
                     .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path))
                     .values()
+                    // Loads are synthesized from the rule set below; keeping
+                    // the parsed ones too emits each import twice.
+                    .filter(|rule| !matches!(rule, Rule::Load(_)))
                     .cloned()
                     .collect::<Vec<_>>()
             };
@@ -158,8 +162,21 @@ impl BuckalChange {
             } else {
                 rules.push(export_file);
             }
+            // Same gate as the main writer.
+            reject_name_collisions(&manual, &buck_path, &rules);
+
             let buck_content = gen_buck_content_with_loads(&rules, &loads_for(&manual));
-            let buck_content = append_manual_section(buck_content, &manual);
+            // Only claim ownership this writer can justify. It knows what *it*
+            // emits -- the workspace export -- not what generated the rest, so
+            // on a file that predates the marker it leaves the question open
+            // rather than declaring everything above generated. The main path
+            // bootstraps that file properly the next time it regenerates the
+            // package, with the real generated set to compare against.
+            let buck_content = if had_marker || content.trim().is_empty() {
+                append_manual_section(buck_content, &manual)
+            } else {
+                buck_content
+            };
             std::fs::write(&buck_path, buck_content).expect("Failed to write BUCK file");
         }
     }
@@ -199,18 +216,7 @@ fn merge_rules(buck_path: &Utf8Path, buck_rules: &mut [Rule], ctx: &BuckalContex
     // would drop the text between statements, which is where the comments are.
     if let Some(manual) = split_manual_section(&content) {
         let manual = manual.trim();
-        let clashes = colliding_target_names(manual, buck_path, buck_rules);
-        if !clashes.is_empty() {
-            buckal_error!(
-                "{}: the manual section declares target(s) {} that cargo-buckal now \
-                 generates. Buck target names are unique within a package, so this file \
-                 was left unchanged. Rename the target(s) below the manual marker and \
-                 re-run.",
-                buck_path,
-                clashes.join(", ")
-            );
-            std::process::exit(1);
-        }
+        reject_name_collisions(manual, buck_path, buck_rules);
         return manual.to_owned();
     }
 
@@ -308,14 +314,35 @@ fn loads_for(manual: &str) -> std::collections::BTreeSet<String> {
         .map(|binding| binding.local.as_str())
         .collect();
 
-    statements
-        .iter()
-        .filter_map(|stmt| stmt.call_name.as_deref())
-        .filter(|call| WRAPPER_SYMBOLS.contains(call) || *call == CARGO_MANIFEST_SYMBOL)
+    // Every identifier the section reaches, not only the ones it calls: a
+    // symbol assigned to another name is used just as surely as one invoked.
+    let Ok(referenced) = referenced_identifiers(manual, "manual section") else {
+        return std::collections::BTreeSet::new();
+    };
+
+    referenced
+        .into_iter()
+        .filter(|name| WRAPPER_SYMBOLS.contains(&name.as_str()) || name == CARGO_MANIFEST_SYMBOL)
         // A load the user wrote in their own section already binds it.
-        .filter(|call| !bound_here.contains(call))
-        .map(|call| call.to_owned())
+        .filter(|name| !bound_here.contains(name.as_str()))
         .collect()
+}
+
+/// Stop before writing a package whose manual and generated targets share a
+/// name. Shared by both writers, so adding one cannot bypass the check.
+fn reject_name_collisions(manual: &str, buck_path: &Utf8Path, generated: &[Rule]) {
+    let clashes = colliding_target_names(manual, buck_path, generated);
+    if clashes.is_empty() {
+        return;
+    }
+    buckal_error!(
+        "{}: the manual section declares target(s) {} that cargo-buckal now generates. \
+         Buck target names are unique within a package, so this file was left unchanged. \
+         Rename the target(s) below the manual marker and re-run.",
+        buck_path,
+        clashes.join(", ")
+    );
+    std::process::exit(1);
 }
 
 /// Names declared in both the manual section and the generated rules.
@@ -1016,5 +1043,173 @@ mod tests {
         })];
 
         assert!(colliding_target_names(manual, Utf8Path::new("BUCK"), &generated).is_empty());
+    }
+
+    /// An imported symbol may be reached without being called. Carrying the
+    /// statements without the import binds `manual_test` to whatever `rust_test`
+    /// happens to mean -- Buck's native rule, or nothing.
+    #[test]
+    fn test_import_used_as_a_value_keeps_its_binding() {
+        let existing = concat!(
+            "load(\"@buckal//:wrapper.bzl\", \"rust_test\")\n\n",
+            "manual_test = rust_test\n\n",
+            "manual_test(\n    name = \"manual\",\n)\n",
+        );
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(existing, lib_only());
+
+        change.apply(&ctx);
+        let first = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        let header: String = first
+            .lines()
+            .filter(|line| line.contains("@buckal//:wrapper.bzl"))
+            .collect();
+        assert!(
+            header.contains("rust_test"),
+            "the assignment uses rust_test as a value, so it must stay bound. \
+             Header was: {header}"
+        );
+        assert!(
+            first.contains("manual_test = rust_test"),
+            "and the assignment itself must survive, got:\n{first}"
+        );
+
+        // And again on the run after the bootstrap, reading from the marker.
+        change.apply(&ctx);
+        let second = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        assert_eq!(first, second, "second run changed the file:\n{second}");
+    }
+
+    /// The workspace-export writer knows what *it* emits, not what generated
+    /// the rest of a file that predates the marker. It must not answer the
+    /// ownership question it cannot answer -- writing a marker there would
+    /// declare every existing statement generated, and the next regeneration
+    /// would delete them.
+    #[test]
+    fn test_fallback_does_not_mark_a_legacy_file() {
+        let existing = concat!(
+            "rust_test(\n",
+            "    name = \"manual\",\n",
+            "    crate = \"manual\",\n",
+            "    crate_root = \"tests/it.rs\",\n",
+            "    edition = \"2021\",\n",
+            ")\n",
+        );
+        let (_tmp, tmp_path, _change, mut ctx) = merge_fixture(existing, lib_only());
+        ctx.workspace_inherit = true;
+        let empty = BuckalChange {
+            changes: BTreeMap::new(),
+        };
+        empty.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        assert!(
+            !content.contains(MANUAL_SECTION_MARKER),
+            "the fallback cannot establish ownership of a legacy file, so it must \
+             leave the question open for the main path, got:\n{content}"
+        );
+        assert!(
+            content.contains("export_file("),
+            "while still writing the workspace export, got:\n{content}"
+        );
+    }
+
+    /// ...and once the main path has bootstrapped the file, the fallback keeps
+    /// the manual rule below the marker rather than deleting it.
+    #[test]
+    fn test_legacy_rule_survives_bootstrap_then_fallback() {
+        let existing = concat!(
+            "rust_test(\n",
+            "    name = \"manual\",\n",
+            "    crate = \"manual\",\n",
+            "    crate_root = \"tests/it.rs\",\n",
+            "    edition = \"2021\",\n",
+            ")\n",
+        );
+        let (_tmp, tmp_path, change, mut ctx) = merge_fixture(existing, lib_only());
+
+        // Main path bootstraps it.
+        change.apply(&ctx);
+        let bootstrapped = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        assert!(bootstrapped.contains(MANUAL_SECTION_MARKER));
+
+        // Then a later migration where no changed package owns the manifest.
+        ctx.workspace_inherit = true;
+        let empty = BuckalChange {
+            changes: BTreeMap::new(),
+        };
+        empty.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        let (_, carried) = content
+            .split_once(MANUAL_SECTION_MARKER)
+            .expect("marker survives");
+        assert!(
+            carried.contains("name = \"manual\""),
+            "the bootstrapped rule must survive the fallback too, got:\n{content}"
+        );
+    }
+
+    /// The fallback adds `export_file(name = "workspace")`, so a manual target
+    /// of that name collides just as one in the main path does.
+    #[test]
+    fn test_fallback_rejects_a_workspace_name_collision() {
+        let generated = vec![Rule::ExportFile(crate::buck::ExportFile {
+            name: "workspace".to_owned(),
+            ..Default::default()
+        })];
+        let manual = "export_file(\n    name = \"workspace\",\n    src = \"mine.txt\",\n)\n";
+
+        let clashes = colliding_target_names(manual, Utf8Path::new("BUCK"), &generated);
+        assert_eq!(
+            clashes,
+            vec!["workspace".to_owned()],
+            "the fallback's own export must be checked against the manual section"
+        );
+    }
+
+    /// Loads are synthesized from the rule set, so keeping the parsed ones too
+    /// emitted every import twice.
+    #[test]
+    fn test_fallback_does_not_duplicate_generated_loads() {
+        let existing = format!(
+            concat!(
+                "# @generated by `cargo buckal`\n\n",
+                "load(\"@buckal//:wrapper.bzl\", \"rust_library\")\n\n",
+                "rust_library(\n",
+                "    name = \"myroot\",\n",
+                "    crate = \"myroot\",\n",
+                "    crate_root = \"vendor/src/lib.rs\",\n",
+                "    edition = \"2021\",\n",
+                ")\n\n",
+                "export_file(\n    name = \"workspace\",\n    src = \"Cargo.toml\",\n)\n\n",
+                "{}\n",
+            ),
+            MANUAL_SECTION_MARKER
+        );
+        let (_tmp, tmp_path, _change, mut ctx) = merge_fixture(&existing, lib_only());
+        ctx.workspace_inherit = true;
+        let empty = BuckalChange {
+            changes: BTreeMap::new(),
+        };
+
+        empty.apply(&ctx);
+        let first = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        empty.apply(&ctx);
+        let second = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+
+        assert_eq!(
+            first, second,
+            "repeated fallback runs must be stable; first:\n{first}\nsecond:\n{second}"
+        );
+        assert_eq!(
+            first.matches("export_file(").count(),
+            1,
+            "one workspace export, got:\n{first}"
+        );
+        assert_eq!(
+            first.matches("@buckal//:wrapper.bzl").count(),
+            1,
+            "one wrapper import, not one parsed plus one synthesized, got:\n{first}"
+        );
     }
 }
