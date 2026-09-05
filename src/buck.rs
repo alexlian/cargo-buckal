@@ -82,6 +82,22 @@ pub struct SourceStatement {
     pub text: String,
 }
 
+/// Separates the region cargo-buckal generates from the region it only carries.
+///
+/// Written by every migration, so its **absence** is meaningful: a file without
+/// it predates the marker and its statements have unknown ownership. A file
+/// with it and nothing below asserts there is no hand-written content, which is
+/// a different claim entirely.
+pub const MANUAL_SECTION_MARKER: &str =
+    "# --- cargo-buckal: statements below this line are yours and are preserved verbatim ---";
+
+/// Return the manual region of a BUCK file, or `None` if it has no marker.
+pub fn split_manual_section(content: &str) -> Option<&str> {
+    content
+        .find(MANUAL_SECTION_MARKER)
+        .map(|at| &content[at + MANUAL_SECTION_MARKER.len()..])
+}
+
 /// Split a BUCK file into its top-level statements, each carrying its own
 /// source text.
 pub fn parse_buck_statements(content: &str, origin: &str) -> anyhow::Result<Vec<SourceStatement>> {

@@ -2,7 +2,7 @@ use cargo_metadata::camino::Utf8Path;
 use regex::Regex;
 
 use crate::{
-    buck::{Rule, parse_buck_file, patch_buck_rules},
+    buck::{MANUAL_SECTION_MARKER, Rule, parse_buck_file, patch_buck_rules, split_manual_section},
     buckal_log,
     buckify::emit::emit_export_file,
     cache::{BuckalChange, ChangeType},
@@ -64,7 +64,7 @@ impl BuckalChange {
 
                         // Patch BUCK Rules
                         let buck_path = vendor_dir.join("BUCK");
-                        merge_rules(&buck_path, &mut buck_rules, ctx);
+                        let manual = merge_rules(&buck_path, &mut buck_rules, ctx);
 
                         // Generate the BUCK file
                         let mut buck_content = gen_buck_content(&buck_rules);
@@ -73,6 +73,9 @@ impl BuckalChange {
                                 windows::patch_root_windows_rustc_flags(buck_content, ctx, node);
                         }
                         buck_content = cross::patch_rust_test_target_compatible_with(buck_content);
+                        // After the generated-content patches, so those only
+                        // ever rewrite rules this run produced.
+                        buck_content = append_manual_section(buck_content, &manual);
                         std::fs::write(&buck_path, buck_content)
                             .expect("Failed to write BUCK file");
                     }
@@ -141,19 +144,57 @@ pub(super) fn is_third_party(node: &BuckalNode) -> bool {
     matches!(node.kind, NodeKind::ThirdParty)
 }
 
-/// Merge existing BUCK rules with new ones, preserving manual changes in specified fields.
-fn merge_rules(buck_path: &Utf8Path, buck_rules: &mut [Rule], ctx: &BuckalContext) {
-    if buck_path.exists() {
-        // Skip merging manual changes if `--no-merge` is set
-        if !ctx.no_merge && !ctx.repo_config.patch_fields.is_empty() {
-            let existing_rules = parse_buck_file(buck_path)
-                .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
-            patch_buck_rules(&existing_rules, buck_rules, &ctx.repo_config.patch_fields);
-        }
-    } else {
+/// Merge existing BUCK rules with new ones, preserving manual changes in
+/// specified fields, and return the file's manual section to carry forward.
+fn merge_rules(buck_path: &Utf8Path, buck_rules: &mut [Rule], ctx: &BuckalContext) -> String {
+    if !buck_path.exists() {
         std::fs::File::create(buck_path)
             .unwrap_or_exit_ctx(format!("Failed to create {}", buck_path));
+        return String::new();
     }
+
+    // Merging is what `--merge` asks for; without it the file is regenerated
+    // from the manifest alone.
+    if ctx.no_merge {
+        return String::new();
+    }
+
+    let content = std::fs::read_to_string(buck_path)
+        .unwrap_or_exit_ctx(format!("Failed to read {}", buck_path));
+
+    if !ctx.repo_config.patch_fields.is_empty() {
+        let existing_rules =
+            parse_buck_file(buck_path).unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
+        patch_buck_rules(&existing_rules, buck_rules, &ctx.repo_config.patch_fields);
+    }
+
+    // Whatever is below the marker is the user's, and is reproduced exactly --
+    // comments, blank lines and all. Re-emitting it statement by statement
+    // would drop the text between statements, which is where the comments are.
+    split_manual_section(&content)
+        .map(|manual| manual.trim().to_owned())
+        .unwrap_or_default()
+}
+
+/// Close the generated region with the ownership marker, then re-emit the
+/// manual section beneath it.
+///
+/// The marker is written **always**, not only when something is carried. It is
+/// the record of where cargo-buckal's output stops, so a file that omits it is
+/// one whose ownership was never recorded; if it appeared only alongside manual
+/// content, every file without manual content would read as legacy forever and
+/// the generated region could never be safely replaced.
+fn append_manual_section(buck_content: String, manual: &str) -> String {
+    let mut out = buck_content.trim_end().to_owned();
+    out.push_str("\n\n");
+    out.push_str(MANUAL_SECTION_MARKER);
+    out.push('\n');
+    if !manual.trim().is_empty() {
+        out.push('\n');
+        out.push_str(manual.trim_end());
+        out.push('\n');
+    }
+    out
 }
 
 #[cfg(test)]
@@ -164,6 +205,7 @@ mod tests {
     use daggy::Dag;
 
     use crate::{
+        buck::MANUAL_SECTION_MARKER,
         cache::{BuckalChange, ChangeType},
         config::RepoConfig,
         context::BuckalContext,
@@ -267,6 +309,188 @@ mod tests {
         assert!(
             content.contains("load("),
             "BUCK file should contain load statements, got:\n{content}"
+        );
+    }
+
+    /// Set up a root package whose BUCK file already exists, so `apply` takes
+    /// the merge path. `specs` are (target name, kind, path relative to root).
+    fn merge_fixture(
+        existing_buck: &str,
+        specs: Vec<(&str, TargetKind, &str)>,
+    ) -> (tempfile::TempDir, Utf8PathBuf, BuckalChange, BuckalContext) {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let tmp_path =
+            Utf8PathBuf::try_from(tmp.path().to_path_buf()).expect("temp dir is not valid UTF-8");
+
+        std::fs::write(
+            tmp_path.join("Cargo.toml"),
+            "[package]\nname = \"myroot\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write Cargo.toml");
+
+        let src_dir = tmp_path.join("src");
+        std::fs::create_dir_all(&src_dir).expect("create src dir");
+        std::fs::write(src_dir.join("lib.rs"), "").expect("write lib.rs");
+        std::fs::write(src_dir.join("main.rs"), "").expect("write main.rs");
+        std::fs::write(tmp_path.join("BUCK"), existing_buck).expect("write existing BUCK");
+
+        let targets = specs
+            .into_iter()
+            .map(|(name, kind, rel)| mock_target(name, kind, tmp_path.join(rel)))
+            .collect();
+        let node = mock_first_party_node("myroot", tmp_path.join("Cargo.toml"), targets);
+        let package_id = node.package_id.clone();
+
+        let mut dag = Dag::new();
+        let idx = dag.add_node(node);
+        let mut index_map = HashMap::new();
+        index_map.insert(package_id.clone(), idx);
+        let resolve = BuckalResolve { dag, index_map };
+
+        let mut changes = BTreeMap::new();
+        changes.insert(package_id.clone(), ChangeType::Changed);
+        let change = BuckalChange { changes };
+
+        let ctx = BuckalContext {
+            root: Some(package_id),
+            resolve,
+            workspace_root: tmp_path.clone(),
+            workspace_inherit: false,
+            no_merge: false,
+            repo_config: RepoConfig::default(),
+        };
+
+        (tmp, tmp_path, change, ctx)
+    }
+
+    fn lib_only() -> Vec<(&'static str, TargetKind, &'static str)> {
+        vec![("myroot", TargetKind::Lib, "src/lib.rs")]
+    }
+
+    /// The marker records where generated output stops, so it has to be written
+    /// unconditionally. If it appeared only when something was carried, a file
+    /// with no hand-written content would be indistinguishable from one that
+    /// predates the marker, and its generated region could never be safely
+    /// replaced.
+    #[test]
+    fn test_marker_is_written_even_with_no_manual_content() {
+        let (_tmp, tmp_path, change, ctx) = merge_fixture("", lib_only());
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        assert!(
+            content.contains(MANUAL_SECTION_MARKER),
+            "every generated file records where its generated region ends, got:\n{content}"
+        );
+    }
+
+    /// An empty manual section is a claim -- "nothing here is mine" -- and
+    /// dropping the marker would silently retract it.
+    #[test]
+    fn test_empty_manual_section_keeps_its_marker() {
+        let existing = format!("# @generated by `cargo buckal`\n\n{MANUAL_SECTION_MARKER}\n");
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(&existing, lib_only());
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        assert!(
+            content.contains(MANUAL_SECTION_MARKER),
+            "the marker must survive an empty manual section, got:\n{content}"
+        );
+    }
+
+    /// Everything above the marker is the generator's and is replaced. A rule
+    /// it used to emit and no longer emits -- a renamed or deleted Cargo target
+    /// -- goes with it, instead of outliving every later migration pointing at
+    /// a source file that is gone.
+    #[test]
+    fn test_rules_above_the_marker_are_regenerated() {
+        let existing = format!(
+            concat!(
+                "# @generated by `cargo buckal`\n\n",
+                "rust_binary(\n",
+                "    name = \"gone-bin\",\n",
+                "    srcs = [\":vendor\"],\n",
+                "    crate = \"gone_bin\",\n",
+                "    crate_root = \"vendor/src/bin/gone.rs\",\n",
+                "    edition = \"2021\",\n",
+                ")\n\n",
+                "{}\n",
+            ),
+            MANUAL_SECTION_MARKER
+        );
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(&existing, lib_only());
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        assert!(
+            !content.contains("gone-bin"),
+            "a rule above the marker is generator-owned, got:\n{content}"
+        );
+    }
+
+    /// The manual section comes back exactly as written -- including the text
+    /// between statements, which is where comments and spacing live. Re-emitting
+    /// it statement by statement would drop all of it.
+    #[test]
+    fn test_manual_section_is_reproduced_byte_for_byte() {
+        let manual = concat!(
+            "# why this rule exists, and a note nobody should lose\n",
+            "load(\"//my:defs.bzl\", \"my_macro\")\n",
+            "\n",
+            "my_macro(\n",
+            "    name = \"widget\",\n",
+            "    srcs = glob([\"widgets/**/*.txt\"]),\n",
+            "    weird_attr = select({\"DEFAULT\": 1}),\n",
+            ")\n",
+        );
+        let existing =
+            format!("# @generated by `cargo buckal`\n\n{MANUAL_SECTION_MARKER}\n\n{manual}");
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(&existing, lib_only());
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        let (_, carried) = content
+            .split_once(MANUAL_SECTION_MARKER)
+            .expect("marker present");
+        assert_eq!(
+            carried.trim(),
+            manual.trim(),
+            "the manual section must come back unchanged, got:\n{carried}"
+        );
+    }
+
+    /// Two migrations in a row must produce the same bytes.
+    #[test]
+    fn test_merge_is_idempotent() {
+        let existing = format!(
+            "# @generated by `cargo buckal`\n\n{MANUAL_SECTION_MARKER}\n\n# keep me\nmy_macro(\n    name = \"widget\",\n)\n"
+        );
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(&existing, lib_only());
+
+        change.apply(&ctx);
+        let first = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        change.apply(&ctx);
+        let second = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+
+        assert_eq!(first, second, "second run changed the file:\n{second}");
+    }
+
+    /// Without `--merge` the file is regenerated from the manifest alone.
+    #[test]
+    fn test_without_merge_the_manual_section_is_not_carried() {
+        let existing = format!(
+            "# @generated by `cargo buckal`\n\n{MANUAL_SECTION_MARKER}\n\nmy_macro(\n    name = \"widget\",\n)\n"
+        );
+        let (_tmp, tmp_path, change, mut ctx) = merge_fixture(&existing, lib_only());
+        ctx.no_merge = true;
+
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        assert!(
+            !content.contains("my_macro"),
+            "--merge is what asks for carrying, got:\n{content}"
         );
     }
 }
