@@ -3,10 +3,10 @@ use regex::Regex;
 
 use crate::{
     buck::{
-        MANUAL_SECTION_MARKER, Rule, SourceStatement, parse_buck_file, parse_buck_statements,
-        patch_buck_rules, split_manual_section,
+        MANUAL_SECTION_MARKER, Rule, generated_region, parse_buck_content, parse_buck_file,
+        parse_buck_statements, patch_buck_rules, split_manual_section,
     },
-    buckal_log, buckal_warn,
+    buckal_error, buckal_log, buckal_warn,
     buckify::emit::emit_export_file,
     cache::{BuckalChange, ChangeType},
     context::BuckalContext,
@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     CARGO_MANIFEST_SYMBOL, WRAPPER_SYMBOLS, buckify_dep_node, buckify_root_node, cross,
-    gen_buck_content, gen_buck_content_with_loads, vendor_package, windows,
+    gen_buck_content_with_loads, vendor_package, windows,
 };
 
 impl BuckalChange {
@@ -119,17 +119,35 @@ impl BuckalChange {
             }
         }
 
-        // Export workspace manifest for virtual workspace
+        // Export workspace manifest for virtual workspace.
+        //
+        // This runs when no changed package owned the workspace manifest, which
+        // includes an unchanged root on a later migration -- so it writes a
+        // package file that the loop above may already have marked. It has to
+        // honour the same contract: parse only the generated region, carry the
+        // manual section through untouched, and re-close the file with the
+        // marker. Reconstructing the whole file through `Rule` values, as it
+        // used to, dropped the marker and rewrote the user's statements.
         if !workspace_emitted && ctx.workspace_inherit {
             let buck_path = ctx.workspace_root.join("BUCK");
-            let mut rules = if buck_path.exists() {
-                parse_buck_file(&buck_path)
+            let content = if buck_path.exists() {
+                std::fs::read_to_string(&buck_path)
+                    .unwrap_or_exit_ctx(format!("Failed to read {}", buck_path))
+            } else {
+                String::new()
+            };
+            let manual = split_manual_section(&content)
+                .map(|manual| manual.trim().to_owned())
+                .unwrap_or_default();
+
+            let mut rules = if content.is_empty() {
+                Vec::new()
+            } else {
+                parse_buck_content(generated_region(&content), buck_path.as_str())
                     .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path))
                     .values()
                     .cloned()
                     .collect::<Vec<_>>()
-            } else {
-                Vec::new()
             };
             let export_file = Rule::ExportFile(emit_export_file());
             if let Some(existing) = rules
@@ -140,7 +158,8 @@ impl BuckalChange {
             } else {
                 rules.push(export_file);
             }
-            let buck_content = gen_buck_content(&rules);
+            let buck_content = gen_buck_content_with_loads(&rules, &loads_for(&manual));
+            let buck_content = append_manual_section(buck_content, &manual);
             std::fs::write(&buck_path, buck_content).expect("Failed to write BUCK file");
         }
     }
@@ -179,7 +198,20 @@ fn merge_rules(buck_path: &Utf8Path, buck_rules: &mut [Rule], ctx: &BuckalContex
     // comments, blank lines and all. Re-emitting it statement by statement
     // would drop the text between statements, which is where the comments are.
     if let Some(manual) = split_manual_section(&content) {
-        return manual.trim().to_owned();
+        let manual = manual.trim();
+        let clashes = colliding_target_names(manual, buck_path, buck_rules);
+        if !clashes.is_empty() {
+            buckal_error!(
+                "{}: the manual section declares target(s) {} that cargo-buckal now \
+                 generates. Buck target names are unique within a package, so this file \
+                 was left unchanged. Rename the target(s) below the manual marker and \
+                 re-run.",
+                buck_path,
+                clashes.join(", ")
+            );
+            std::process::exit(1);
+        }
+        return manual.to_owned();
     }
 
     bootstrap_manual_section(&content, buck_path, buck_rules)
@@ -206,11 +238,18 @@ fn bootstrap_manual_section(content: &str, buck_path: &Utf8Path, generated: &[Ru
             // A load of a module cargo-buckal synthesizes is part of the old
             // header and is rebuilt; a load of anything else was written by
             // hand, and whatever it binds is needed by a statement below.
+            //
+            // An alias is never ours: `manual_test = "rust_test"` binds a name
+            // the generator would not produce, so the load is the user's
+            // however familiar its module looks -- and nothing could rebuild it,
+            // since the local name appears in no rule.
             if stmt.is_load {
-                return !stmt
+                let ours = stmt
                     .load_module
                     .as_deref()
-                    .is_some_and(is_generated_load_module);
+                    .is_some_and(is_generated_load_module)
+                    && !stmt.load_bindings.iter().any(|b| b.is_alias());
+                return !ours;
             }
             match &stmt.target_name {
                 // Buck target names are unique within a package across rule
@@ -259,15 +298,49 @@ fn loads_for(manual: &str) -> std::collections::BTreeSet<String> {
         return std::collections::BTreeSet::new();
     };
 
-    let bound_here: Vec<&SourceStatement> = statements.iter().filter(|s| s.is_load).collect();
+    // Exact local bindings. A substring search over the load's text would
+    // answer a different question: `//my:rust_test_helpers.bzl` contains
+    // "rust_test" and binds nothing of the sort.
+    let bound_here: std::collections::BTreeSet<&str> = statements
+        .iter()
+        .filter(|stmt| stmt.is_load)
+        .flat_map(|stmt| stmt.load_bindings.iter())
+        .map(|binding| binding.local.as_str())
+        .collect();
 
     statements
         .iter()
         .filter_map(|stmt| stmt.call_name.as_deref())
         .filter(|call| WRAPPER_SYMBOLS.contains(call) || *call == CARGO_MANIFEST_SYMBOL)
         // A load the user wrote in their own section already binds it.
-        .filter(|call| !bound_here.iter().any(|load| load.text.contains(*call)))
+        .filter(|call| !bound_here.contains(call))
         .map(|call| call.to_owned())
+        .collect()
+}
+
+/// Names declared in both the manual section and the generated rules.
+///
+/// Buck target names are unique within a package, so emitting both produces a
+/// package Buck cannot load. The marker assigns those statements to the user,
+/// which makes silently dropping one the wrong answer too -- the caller stops
+/// and says which name clashes, leaving the file as it was.
+fn colliding_target_names(manual: &str, buck_path: &Utf8Path, generated: &[Rule]) -> Vec<String> {
+    let Ok(statements) = parse_buck_statements(manual, buck_path.as_str()) else {
+        // Unparseable manual content is the user's business; it is carried
+        // unchanged, and no claim is made about what it declares.
+        return Vec::new();
+    };
+
+    let generated_names: std::collections::BTreeSet<&str> = generated
+        .iter()
+        .filter_map(|rule| rule.target_name())
+        .collect();
+
+    statements
+        .iter()
+        .filter_map(|stmt| stmt.target_name.as_deref())
+        .filter(|name| generated_names.contains(name))
+        .map(|name| name.to_owned())
         .collect()
 }
 
@@ -299,6 +372,7 @@ mod tests {
     use cargo_metadata::{PackageId, camino::Utf8PathBuf};
     use daggy::Dag;
 
+    use super::{Rule, Utf8Path, colliding_target_names};
     use crate::{
         buck::MANUAL_SECTION_MARKER,
         cache::{BuckalChange, ChangeType},
@@ -790,5 +864,157 @@ mod tests {
 
         assert_eq!(first, second, "second run changed the file:\n{second}");
         assert_eq!(second, third, "third run changed the file:\n{third}");
+    }
+
+    /// An aliased import binds a name the generator would never produce, so
+    /// nothing could rebuild it -- the load is the user's however familiar its
+    /// module looks. Dropping it left the call with no binding.
+    #[test]
+    fn test_legacy_aliased_wrapper_load_survives() {
+        let existing = concat!(
+            "load(\"@buckal//:wrapper.bzl\", \"rust_library\")\n",
+            "load(\"@buckal//:wrapper.bzl\", manual_test = \"rust_test\")\n\n",
+            "manual_test(\n    name = \"manual\",\n)\n",
+        );
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(existing, lib_only());
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        assert!(
+            content.contains("manual_test = \"rust_test\""),
+            "the aliased binding must survive, got:\n{content}"
+        );
+        assert!(
+            content.contains("manual_test(\n    name = \"manual\","),
+            "and the call that needs it, got:\n{content}"
+        );
+    }
+
+    /// Whether a symbol is already bound is a question about bindings, not about
+    /// text. A module path may contain the symbol's name and bind nothing of the
+    /// sort.
+    #[test]
+    fn test_import_substring_is_not_a_binding() {
+        let existing = format!(
+            concat!(
+                "# @generated by `cargo buckal`\n\n{}\n\n",
+                "load(\"//my:rust_test_helpers.bzl\", \"helper\")\n\n",
+                "rust_test(\n    name = \"manual\",\n)\n",
+            ),
+            MANUAL_SECTION_MARKER
+        );
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(&existing, lib_only());
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        let header: String = content
+            .lines()
+            .filter(|line| line.contains("@buckal//:wrapper.bzl"))
+            .collect();
+        assert!(
+            header.contains("rust_test"),
+            "the helper module binds only `helper`, so the wrapper's rust_test is \
+             still needed. Header was: {header}"
+        );
+    }
+
+    /// An alias in the manual section *does* bind the name, so the header must
+    /// not also import it under that name.
+    #[test]
+    fn test_manual_alias_counts_as_a_binding() {
+        let existing = format!(
+            concat!(
+                "# @generated by `cargo buckal`\n\n{}\n\n",
+                "load(\"//other:defs.bzl\", rust_test = \"their_test\")\n\n",
+                "rust_test(\n    name = \"manual\",\n)\n",
+            ),
+            MANUAL_SECTION_MARKER
+        );
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(&existing, lib_only());
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        let header: String = content
+            .lines()
+            .filter(|line| line.contains("@buckal//:wrapper.bzl"))
+            .collect();
+        assert!(
+            !header.contains("rust_test"),
+            "the manual section binds rust_test itself; importing it again would \
+             shadow the user's choice. Header was: {header}"
+        );
+    }
+
+    /// The workspace-export fallback writes a package file too, and runs when no
+    /// changed package owned the workspace manifest -- an unchanged root on a
+    /// later migration. It must honour the same contract as the main path, or a
+    /// preserved file does not stay preserved.
+    #[test]
+    fn test_workspace_fallback_preserves_the_manual_section() {
+        let manual = concat!(
+            "# a note worth keeping\n",
+            "load(\"//my:defs.bzl\", \"my_macro\")\n",
+            "\n",
+            "my_macro(\n    name = \"widget\",\n)\n",
+        );
+        let existing =
+            format!("# @generated by `cargo buckal`\n\n{MANUAL_SECTION_MARKER}\n\n{manual}");
+        let (_tmp, tmp_path, _change, mut ctx) = merge_fixture(&existing, lib_only());
+
+        // No changed package owns the workspace manifest: only the fallback runs.
+        ctx.workspace_inherit = true;
+        let empty = BuckalChange {
+            changes: BTreeMap::new(),
+        };
+        empty.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        assert!(
+            content.contains(MANUAL_SECTION_MARKER),
+            "the fallback must not drop the marker, got:\n{content}"
+        );
+        assert!(
+            content.contains("# a note worth keeping"),
+            "nor the user's comments, got:\n{content}"
+        );
+        assert!(
+            content.contains("my_macro(") && content.contains("//my:defs.bzl"),
+            "nor the macro and its import, got:\n{content}"
+        );
+        assert!(
+            content.contains("export_file("),
+            "while still writing the workspace export, got:\n{content}"
+        );
+        assert_eq!(
+            content.matches(MANUAL_SECTION_MARKER).count(),
+            1,
+            "and exactly one marker, got:\n{content}"
+        );
+    }
+
+    /// A manual target and a generated one may not share a name. The marker
+    /// says the statement is the user's, so the answer is neither to drop it nor
+    /// to emit an unloadable package: stop and say which name clashes.
+    #[test]
+    fn test_manual_and_generated_name_collisions_are_reported() {
+        let manual = "rust_test(\n    name = \"myroot\",\n)\n";
+        let generated = vec![Rule::RustLibrary(crate::buck::RustLibrary {
+            name: "myroot".to_owned(),
+            ..Default::default()
+        })];
+
+        let clashes = colliding_target_names(manual, Utf8Path::new("BUCK"), &generated);
+        assert_eq!(clashes, vec!["myroot".to_owned()]);
+    }
+
+    #[test]
+    fn test_distinct_manual_names_do_not_collide() {
+        let manual = "rust_test(\n    name = \"hand-written-it\",\n)\n";
+        let generated = vec![Rule::RustLibrary(crate::buck::RustLibrary {
+            name: "myroot".to_owned(),
+            ..Default::default()
+        })];
+
+        assert!(colliding_target_names(manual, Utf8Path::new("BUCK"), &generated).is_empty());
     }
 }

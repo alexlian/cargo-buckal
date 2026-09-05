@@ -54,6 +54,29 @@ impl Rule {
     }
 }
 
+/// One name a `load(...)` brings into scope.
+///
+/// Starlark loads may alias — `load("//m.bzl", manual_test = "rust_test")` binds
+/// `manual_test` locally to the module's `rust_test`. Deciding whether a symbol
+/// is already in scope, or whether a load is one cargo-buckal would synthesize,
+/// needs both halves; a substring search over the load's text answers neither
+/// (a module path of `//my:rust_test_helpers.bzl` "contains" `rust_test` while
+/// binding nothing of the sort).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadBinding {
+    /// The name this file can call — `manual_test` above.
+    pub local: String,
+    /// The name the module exports — `rust_test` above.
+    pub exported: String,
+}
+
+impl LoadBinding {
+    /// Whether the binding renames what it imports.
+    pub fn is_alias(&self) -> bool {
+        self.local != self.exported
+    }
+}
+
 /// A top-level statement of a BUCK file, kept as the source text that produced
 /// it.
 ///
@@ -78,6 +101,8 @@ pub struct SourceStatement {
     pub is_load: bool,
     /// The module a `load(...)` reads from, e.g. `@buckal//:wrapper.bzl`.
     pub load_module: Option<String>,
+    /// What a `load(...)` binds, local name and exported name both.
+    pub load_bindings: Vec<LoadBinding>,
     /// Verbatim source, exactly as it appeared in the file.
     pub text: String,
 }
@@ -123,12 +148,30 @@ fn collect_source_statements(stmt: &AstStmt, content: &str, out: &mut Vec<Source
         return;
     };
 
-    let (is_load, load_module, call_name, target_name) = match &stmt.node {
-        Stmt::Load(load) => (true, Some(load.module.node.to_string()), None, None),
-        Stmt::Expression(expr) => (false, None, call_name(expr), call_target_name(expr)),
+    let (is_load, load_module, load_bindings, call_name, target_name) = match &stmt.node {
+        Stmt::Load(load) => (
+            true,
+            Some(load.module.node.to_string()),
+            load.args
+                .iter()
+                .map(|arg| LoadBinding {
+                    local: arg.local.node.ident.clone(),
+                    exported: arg.their.node.clone(),
+                })
+                .collect(),
+            None,
+            None,
+        ),
+        Stmt::Expression(expr) => (
+            false,
+            None,
+            Vec::new(),
+            call_name(expr),
+            call_target_name(expr),
+        ),
         // Assignments, `def`s and the like name no target, but a hand-written
         // rule may depend on one, so they are content too.
-        _ => (false, None, None, None),
+        _ => (false, None, Vec::new(), None, None),
     };
 
     out.push(SourceStatement {
@@ -136,6 +179,7 @@ fn collect_source_statements(stmt: &AstStmt, content: &str, out: &mut Vec<Source
         target_name,
         is_load,
         load_module,
+        load_bindings,
         text: text.to_owned(),
     });
 }
@@ -1084,13 +1128,27 @@ fn collect_rules(stmt: &AstStmt, rules: &mut Map<String, Rule>) {
 /// Parse a BUCK file and extract rules into a map keyed by `rule_type[rule_name]` for easy lookup.
 pub fn parse_buck_file<T: AsRef<Utf8Path>>(file: T) -> anyhow::Result<Map<String, Rule>> {
     let buck_content = std::fs::read_to_string(file.as_ref())?;
-    let ast = AstModule::parse(file.as_ref().as_str(), buck_content, &Dialect::Extended)
+    parse_buck_content(&buck_content, file.as_ref().as_str())
+}
+
+/// Parse rules out of BUCK source that is not necessarily a whole file — the
+/// generated region above the manual marker, for instance.
+pub fn parse_buck_content(content: &str, origin: &str) -> anyhow::Result<Map<String, Rule>> {
+    let ast = AstModule::parse(origin, content.to_owned(), &Dialect::Extended)
         .map_err(|e| anyhow::anyhow!("Failed to parse BUCK file: {}", e))?;
 
     let mut buck_rules: Map<String, Rule> = Map::new();
     collect_rules(ast.statement(), &mut buck_rules);
 
     Ok(buck_rules)
+}
+
+/// The generated region of a BUCK file — everything above the manual marker.
+pub fn generated_region(content: &str) -> &str {
+    match content.find(MANUAL_SECTION_MARKER) {
+        Some(at) => &content[..at],
+        None => content,
+    }
 }
 
 pub fn patch_buck_rules(
