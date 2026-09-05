@@ -31,6 +31,125 @@ impl Rule {
             _ => None,
         }
     }
+
+    /// The Buck target name this rule declares, or `None` for `load(...)`.
+    ///
+    /// Distinct from the `rule_type[name]` key `rule_map_key` builds, which is
+    /// scoped by rule type and is the right key for patching fields. Target
+    /// names must be unique within a package *across* types, so a check for
+    /// "does this name already exist" has to ignore the type.
+    pub fn target_name(&self) -> Option<&str> {
+        match self {
+            Rule::Load(_) => None,
+            Rule::HttpArchive(r) => Some(&r.name),
+            Rule::FileGroup(r) => Some(&r.name),
+            Rule::GitFetch(r) => Some(&r.name),
+            Rule::CargoManifest(r) => Some(&r.name),
+            Rule::ExportFile(r) => Some(&r.name),
+            Rule::RustLibrary(r) => Some(&r.name),
+            Rule::RustBinary(r) => Some(&r.name),
+            Rule::RustTest(r) => Some(&r.name),
+            Rule::BuildscriptRun(r) => Some(&r.name),
+        }
+    }
+}
+
+/// A top-level statement of a BUCK file, kept as the source text that produced
+/// it.
+///
+/// [`parse_buck_file`] reconstructs [`Rule`] values, which model only the
+/// attributes cargo-buckal itself emits. That is the right shape for patching
+/// known fields, and the wrong shape for carrying a hand-written rule from one
+/// migration to the next: `glob(...)` sources, `select(...)` values, attributes
+/// outside the struct and whole custom macros have no representation, so a
+/// round-trip through `Rule` silently rewrites the rule into something else.
+/// Preserving the original text is the only way to hand a statement back
+/// unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceStatement {
+    /// The function being called, e.g. `rust_test` — including macros
+    /// cargo-buckal knows nothing about. A carried statement still needs
+    /// whatever binds this name to be in scope.
+    pub call_name: Option<String>,
+    /// The `name = "..."` argument, when the statement is a rule call that has
+    /// one.
+    pub target_name: Option<String>,
+    /// `load(...)` statements are part of the synthesized header, not content.
+    pub is_load: bool,
+    /// The module a `load(...)` reads from, e.g. `@buckal//:wrapper.bzl`.
+    pub load_module: Option<String>,
+    /// Verbatim source, exactly as it appeared in the file.
+    pub text: String,
+}
+
+/// Split a BUCK file into its top-level statements, each carrying its own
+/// source text.
+pub fn parse_buck_statements(content: &str, origin: &str) -> anyhow::Result<Vec<SourceStatement>> {
+    let ast = AstModule::parse(origin, content.to_owned(), &Dialect::Extended)
+        .map_err(|e| anyhow::anyhow!("Failed to parse BUCK file: {}", e))?;
+
+    let mut statements = Vec::new();
+    collect_source_statements(ast.statement(), content, &mut statements);
+    Ok(statements)
+}
+
+fn collect_source_statements(stmt: &AstStmt, content: &str, out: &mut Vec<SourceStatement>) {
+    if let Stmt::Statements(stmts) = &stmt.node {
+        for s in stmts {
+            collect_source_statements(s, content, out);
+        }
+        return;
+    }
+
+    let begin = stmt.span.begin().get() as usize;
+    let end = stmt.span.end().get() as usize;
+    let Some(text) = content.get(begin..end) else {
+        return;
+    };
+
+    let (is_load, load_module, call_name, target_name) = match &stmt.node {
+        Stmt::Load(load) => (true, Some(load.module.node.to_string()), None, None),
+        Stmt::Expression(expr) => (false, None, call_name(expr), call_target_name(expr)),
+        // Assignments, `def`s and the like name no target, but a hand-written
+        // rule may depend on one, so they are content too.
+        _ => (false, None, None, None),
+    };
+
+    out.push(SourceStatement {
+        call_name,
+        target_name,
+        is_load,
+        load_module,
+        text: text.to_owned(),
+    });
+}
+
+/// The identifier being called, for a statement that is a bare call.
+fn call_name(expr: &AstExpr) -> Option<String> {
+    let ExprP::Call(callee, _) = &expr.node else {
+        return None;
+    };
+    match &callee.node {
+        ExprP::Identifier(ident) => Some(ident.node.ident.clone()),
+        _ => None,
+    }
+}
+
+/// Read the `name = "..."` argument out of a rule call, without caring which
+/// rule it is — an unrecognized macro names a target just as a known rule does.
+fn call_target_name(expr: &AstExpr) -> Option<String> {
+    let ExprP::Call(_, args) = &expr.node else {
+        return None;
+    };
+    args.args.iter().find_map(|arg| match &arg.node {
+        ArgumentP::Named(name, value) if name.node == "name" => match &value.node {
+            ExprP::Literal(starlark_syntax::syntax::ast::AstLiteral::String(s)) => {
+                Some(s.node.clone())
+            }
+            _ => None,
+        },
+        _ => None,
+    })
 }
 
 pub trait RustRule {
@@ -1961,5 +2080,91 @@ mod tests {
                 key
             );
         }
+    }
+
+    #[test]
+    fn parse_buck_statements_keeps_source_text_verbatim() {
+        let content = concat!(
+            "load(\"@buckal//:wrapper.bzl\", \"rust_test\")
+",
+            "
+",
+            "rust_test(
+",
+            "    name = \"manual-it\",
+",
+            "    srcs = glob([\"tests/**/*.rs\"]),
+",
+            "    deps = select({\"DEFAULT\": [], \"//os:linux\": [\":extra\"]}),
+",
+            "    some_unknown_attr = \"keepme\",
+",
+            ")
+",
+        );
+
+        let stmts = parse_buck_statements(content, "BUCK").expect("parse should succeed");
+        assert_eq!(stmts.len(), 2);
+
+        assert!(stmts[0].is_load);
+        assert_eq!(stmts[0].target_name, None);
+        assert_eq!(
+            stmts[0].load_module.as_deref(),
+            Some("@buckal//:wrapper.bzl")
+        );
+
+        let rule = &stmts[1];
+        assert!(!rule.is_load);
+        assert_eq!(rule.target_name.as_deref(), Some("manual-it"));
+        // The constructs a `Rule` round-trip would drop must all still be here.
+        assert!(rule.text.contains("glob([\"tests/**/*.rs\"])"));
+        assert!(rule.text.contains("select({"));
+        assert!(rule.text.contains("some_unknown_attr = \"keepme\""));
+    }
+
+    #[test]
+    fn parse_buck_statements_names_unrecognized_macros() {
+        // Not a rule cargo-buckal knows; it still declares a target name, and
+        // a name collision with a generated rule matters just as much.
+        let content = "my_custom_macro(
+    name = \"widget\",
+    thing = 1,
+)
+";
+
+        let stmts = parse_buck_statements(content, "BUCK").expect("parse should succeed");
+        assert_eq!(stmts.len(), 1);
+        assert_eq!(stmts[0].target_name.as_deref(), Some("widget"));
+        // The binding a carried statement needs in scope.
+        assert_eq!(stmts[0].call_name.as_deref(), Some("my_custom_macro"));
+        assert_eq!(stmts[0].text.trim_end(), content.trim_end());
+    }
+
+    #[test]
+    fn parse_buck_statements_keeps_statements_that_name_no_target() {
+        // A hand-written rule may reference a top-level binding, so the
+        // binding is content even though it declares no target.
+        let content = "EXTRA_SRCS = [\"tests/helper.rs\"]
+
+rust_test(
+    name = \"it\",
+)
+";
+
+        let stmts = parse_buck_statements(content, "BUCK").expect("parse should succeed");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0].target_name, None);
+        assert!(!stmts[0].is_load);
+        assert!(stmts[0].text.contains("EXTRA_SRCS"));
+    }
+
+    #[test]
+    fn target_name_ignores_rule_type() {
+        let rules = parse_buck_file(get_test_file("single_rust_library.BUCK"))
+            .expect("parse should succeed");
+        let rule = rules.values().next().expect("one rule");
+        assert_eq!(rule.target_name(), Some("example_lib"));
+        // The map key is type-scoped; target_name() deliberately is not.
+        assert_eq!(rule_map_key(rule), "rust_library[example_lib]");
     }
 }
