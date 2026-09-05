@@ -106,6 +106,9 @@ pub struct SourceStatement {
     pub load_bindings: Vec<LoadBinding>,
     /// Verbatim source, exactly as it appeared in the file.
     pub text: String,
+    /// Byte range of `text` within the source it was parsed from, so a caller
+    /// can replace one statement without rewriting its neighbours.
+    pub span: std::ops::Range<usize>,
 }
 
 /// Separates the region cargo-buckal generates from the region it only carries.
@@ -182,6 +185,7 @@ fn collect_source_statements(stmt: &AstStmt, content: &str, out: &mut Vec<Source
         load_module,
         load_bindings,
         text: text.to_owned(),
+        span: begin..end,
     });
 }
 

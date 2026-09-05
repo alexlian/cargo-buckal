@@ -261,6 +261,12 @@ pub const WRAPPER_SYMBOLS: [&str; 4] = [
 /// The symbol `@buckal//:cargo_manifest.bzl` provides.
 pub const CARGO_MANIFEST_SYMBOL: &str = "cargo_manifest";
 
+/// Render one rule as Starlark, for callers splicing into existing source
+/// rather than regenerating a whole file.
+pub fn render_rule(rule: &Rule) -> String {
+    serde_starlark::to_string(rule).expect("failed to render rule")
+}
+
 pub fn gen_buck_content(rules: &[Rule]) -> String {
     gen_buck_content_with_loads(rules, &Set::new())
 }

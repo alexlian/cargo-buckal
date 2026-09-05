@@ -16,7 +16,7 @@ use crate::{
 
 use super::{
     CARGO_MANIFEST_SYMBOL, WRAPPER_SYMBOLS, buckify_dep_node, buckify_root_node, cross,
-    gen_buck_content_with_loads, vendor_package, windows,
+    gen_buck_content, gen_buck_content_with_loads, render_rule, vendor_package, windows,
 };
 
 impl BuckalChange {
@@ -136,47 +136,43 @@ impl BuckalChange {
             } else {
                 String::new()
             };
-            let had_marker = split_manual_section(&content).is_some();
-            let manual = split_manual_section(&content)
-                .map(|manual| manual.trim().to_owned())
-                .unwrap_or_default();
 
-            let mut rules = if content.is_empty() {
-                Vec::new()
-            } else {
-                parse_buck_content(generated_region(&content), buck_path.as_str())
-                    .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path))
-                    .values()
-                    // Loads are synthesized from the rule set below; keeping
-                    // the parsed ones too emits each import twice.
-                    .filter(|rule| !matches!(rule, Rule::Load(_)))
-                    .cloned()
-                    .collect::<Vec<_>>()
+            let buck_content = match split_manual_section(&content) {
+                // Ownership is recorded: regenerate the generated region and
+                // carry the manual section, exactly as the main writer does.
+                Some(manual) => {
+                    let manual = manual.trim().to_owned();
+                    let mut rules =
+                        parse_buck_content(generated_region(&content), buck_path.as_str())
+                            .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path))
+                            .values()
+                            // Loads are synthesized from the rule set below;
+                            // keeping the parsed ones too emits each twice.
+                            .filter(|rule| !matches!(rule, Rule::Load(_)))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                    upsert_workspace_export(&mut rules);
+                    reject_name_collisions(&manual, &buck_path, &rules);
+                    let generated = gen_buck_content_with_loads(&rules, &loads_for(&manual));
+                    append_manual_section(generated, &manual)
+                }
+                // Nothing to preserve.
+                None if content.trim().is_empty() => {
+                    let mut rules = Vec::new();
+                    upsert_workspace_export(&mut rules);
+                    append_manual_section(gen_buck_content(&rules), "")
+                }
+                // A file this writer did not generate and cannot classify. It
+                // owns exactly one rule here -- the workspace export -- so it
+                // edits that rule and nothing else. Reserializing the file
+                // through `Rule` values would flatten `glob(...)`, drop unknown
+                // attributes and rewrite imports, destroying the very content
+                // the main path is meant to bootstrap later. Declining to write
+                // the marker is not enough on its own: the content has to still
+                // be there when that bootstrap happens.
+                None => splice_workspace_export(&content, &buck_path),
             };
-            let export_file = Rule::ExportFile(emit_export_file());
-            if let Some(existing) = rules
-                .iter_mut()
-                .find(|r| matches!(r, Rule::ExportFile(ef) if ef.name == "workspace"))
-            {
-                *existing = export_file;
-            } else {
-                rules.push(export_file);
-            }
-            // Same gate as the main writer.
-            reject_name_collisions(&manual, &buck_path, &rules);
 
-            let buck_content = gen_buck_content_with_loads(&rules, &loads_for(&manual));
-            // Only claim ownership this writer can justify. It knows what *it*
-            // emits -- the workspace export -- not what generated the rest, so
-            // on a file that predates the marker it leaves the question open
-            // rather than declaring everything above generated. The main path
-            // bootstraps that file properly the next time it regenerates the
-            // package, with the real generated set to compare against.
-            let buck_content = if had_marker || content.trim().is_empty() {
-                append_manual_section(buck_content, &manual)
-            } else {
-                buck_content
-            };
             std::fs::write(&buck_path, buck_content).expect("Failed to write BUCK file");
         }
     }
@@ -326,6 +322,51 @@ fn loads_for(manual: &str) -> std::collections::BTreeSet<String> {
         // A load the user wrote in their own section already binds it.
         .filter(|name| !bound_here.contains(name.as_str()))
         .collect()
+}
+
+/// Install the workspace export into a generated rule list, replacing any
+/// existing one.
+fn upsert_workspace_export(rules: &mut Vec<Rule>) {
+    let export_file = Rule::ExportFile(emit_export_file());
+    if let Some(existing) = rules
+        .iter_mut()
+        .find(|r| matches!(r, Rule::ExportFile(ef) if ef.name == "workspace"))
+    {
+        *existing = export_file;
+    } else {
+        rules.push(export_file);
+    }
+}
+
+/// Update the workspace export inside source this writer does not own, leaving
+/// every other byte of the file alone.
+fn splice_workspace_export(content: &str, buck_path: &Utf8Path) -> String {
+    let rendered = render_rule(&Rule::ExportFile(emit_export_file()));
+
+    let statements = parse_buck_statements(content, buck_path.as_str())
+        .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
+
+    let existing = statements.iter().find(|stmt| {
+        stmt.call_name.as_deref() == Some("export_file")
+            && stmt.target_name.as_deref() == Some("workspace")
+    });
+
+    match existing {
+        Some(stmt) => {
+            let mut out = String::with_capacity(content.len() + rendered.len());
+            out.push_str(&content[..stmt.span.start]);
+            out.push_str(rendered.trim_end());
+            out.push_str(&content[stmt.span.end..]);
+            out
+        }
+        None => {
+            let mut out = content.trim_end().to_owned();
+            out.push_str("\n\n");
+            out.push_str(rendered.trim_end());
+            out.push('\n');
+            out
+        }
+    }
 }
 
 /// Stop before writing a package whose manual and generated targets share a
@@ -1210,6 +1251,143 @@ mod tests {
             first.matches("@buckal//:wrapper.bzl").count(),
             1,
             "one wrapper import, not one parsed plus one synthesized, got:\n{first}"
+        );
+    }
+
+    const LEGACY_ROOT: &str = concat!(
+        "load(\"//my:defs.bzl\", \"rust_test\")\n",
+        "\n",
+        "# a note that must outlive the fallback\n",
+        "rust_test(\n",
+        "    name = \"manual\",\n",
+        "    srcs = glob([\"tests/**/*.rs\"]),\n",
+        "    deps = select({\"DEFAULT\": [], \"//os:linux\": [\":extra\"]}),\n",
+        "    some_unknown_attr = \"keepme\",\n",
+        ")\n",
+    );
+
+    fn run_fallback(existing: &str) -> (tempfile::TempDir, Utf8PathBuf, BuckalContext, String) {
+        let (tmp, tmp_path, _change, mut ctx) = merge_fixture(existing, lib_only());
+        ctx.workspace_inherit = true;
+        let empty = BuckalChange {
+            changes: BTreeMap::new(),
+        };
+        empty.apply(&ctx);
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        (tmp, tmp_path, ctx, content)
+    }
+
+    /// Declining to write the marker on a legacy file is not enough on its own:
+    /// the content has to still be there when the main path bootstraps it. This
+    /// writer owns exactly one rule in the file, so it edits that rule and
+    /// leaves every other byte alone.
+    #[test]
+    fn test_fallback_leaves_legacy_source_untouched() {
+        let (_tmp, _path, _ctx, content) = run_fallback(LEGACY_ROOT);
+
+        assert!(
+            content.contains(LEGACY_ROOT.trim_end()),
+            "the legacy file must survive byte-for-byte, got:\n{content}"
+        );
+        assert!(
+            content.contains("export_file("),
+            "while the workspace export is added, got:\n{content}"
+        );
+        assert!(
+            !content.contains(MANUAL_SECTION_MARKER),
+            "and ownership stays unclaimed, got:\n{content}"
+        );
+    }
+
+    /// Specifically: the import the file chose, not one this tool would have
+    /// picked. Reserializing rewrote `//my:defs.bzl` to the buckal wrapper,
+    /// changing which implementation the preserved target calls.
+    #[test]
+    fn test_fallback_keeps_a_legacy_custom_import() {
+        let (_tmp, _path, _ctx, content) = run_fallback(LEGACY_ROOT);
+
+        assert!(
+            content.contains("load(\"//my:defs.bzl\", \"rust_test\")"),
+            "the file's own import must survive, got:\n{content}"
+        );
+        assert!(
+            !content.contains("@buckal//:wrapper.bzl"),
+            "and must not be replaced by the wrapper, got:\n{content}"
+        );
+    }
+
+    /// And the expressions. `glob(...)` became `srcs = []` when the file was
+    /// rebuilt through `Rule` values.
+    #[test]
+    fn test_fallback_keeps_legacy_expressions_and_comments() {
+        let (_tmp, _path, _ctx, content) = run_fallback(LEGACY_ROOT);
+
+        assert!(
+            content.contains("glob([\"tests/**/*.rs\"])"),
+            "glob lost:\n{content}"
+        );
+        assert!(content.contains("select({"), "select lost:\n{content}");
+        assert!(
+            content.contains("some_unknown_attr = \"keepme\""),
+            "unknown attribute lost:\n{content}"
+        );
+        assert!(
+            content.contains("# a note that must outlive the fallback"),
+            "comment lost:\n{content}"
+        );
+        assert!(
+            !content.contains("srcs = [],"),
+            "glob flattened:\n{content}"
+        );
+    }
+
+    /// A legacy file that already has the export gets it replaced in place, not
+    /// appended a second time.
+    #[test]
+    fn test_fallback_replaces_an_existing_legacy_export() {
+        let existing = format!(
+            "{LEGACY_ROOT}\nexport_file(\n    name = \"workspace\",\n    src = \"stale.toml\",\n)\n"
+        );
+        let (_tmp, _path, _ctx, content) = run_fallback(&existing);
+
+        assert_eq!(
+            content.matches("name = \"workspace\"").count(),
+            1,
+            "exactly one workspace export, got:\n{content}"
+        );
+        assert!(
+            !content.contains("stale.toml"),
+            "and it should be the current one, got:\n{content}"
+        );
+        assert!(
+            content.contains("glob([\"tests/**/*.rs\"])"),
+            "with the rest of the file untouched, got:\n{content}"
+        );
+    }
+
+    /// The fallback preserves it; the main path then bootstraps it. Both halves
+    /// have to hold, and the source has to arrive intact at the end -- not just
+    /// the target's name.
+    #[test]
+    fn test_legacy_survives_fallback_then_bootstrap_intact() {
+        let (_tmp, tmp_path, mut ctx, after_fallback) = run_fallback(LEGACY_ROOT);
+        assert!(after_fallback.contains("glob([\"tests/**/*.rs\"])"));
+
+        // Now a migration that regenerates the package.
+        ctx.workspace_inherit = false;
+        let mut changes = BTreeMap::new();
+        changes.insert(ctx.root.clone().expect("root package"), ChangeType::Changed);
+        BuckalChange { changes }.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        let (_, carried) = content
+            .split_once(MANUAL_SECTION_MARKER)
+            .expect("bootstrapped");
+        assert!(
+            carried.contains("glob([\"tests/**/*.rs\"])")
+                && carried.contains("some_unknown_attr = \"keepme\"")
+                && carried.contains("load(\"//my:defs.bzl\", \"rust_test\")"),
+            "the bootstrap must receive the original source, not a rewrite, got:\n{carried}"
         );
     }
 }
