@@ -247,7 +247,28 @@ pub fn vendor_package(node: &BuckalNode) -> Utf8PathBuf {
 }
 
 /// Generate the content of the BUCK file based on the given rules, including conditional load statements for used rule types.
+/// Symbols `@buckal//:wrapper.bzl` provides. A BUCK file that calls one of
+/// these without loading it does not fail -- it silently binds Buck's native
+/// rule of the same name instead of the wrapper, which is a different
+/// implementation.
+pub const WRAPPER_SYMBOLS: [&str; 4] = [
+    "buildscript_run",
+    "rust_binary",
+    "rust_library",
+    "rust_test",
+];
+
+/// The symbol `@buckal//:cargo_manifest.bzl` provides.
+pub const CARGO_MANIFEST_SYMBOL: &str = "cargo_manifest";
+
 pub fn gen_buck_content(rules: &[Rule]) -> String {
+    gen_buck_content_with_loads(rules, &Set::new())
+}
+
+/// `extra_load_symbols` are bound in the header even though no generated rule
+/// needs them -- for statements carried over from the file's manual section,
+/// which the generated rule list knows nothing about.
+pub fn gen_buck_content_with_loads(rules: &[Rule], extra_load_symbols: &Set<String>) -> String {
     // Analyze which rule types are present to build conditional load statements
     let mut has_cargo_manifest = false;
     let mut has_rust_library = false;
@@ -269,10 +290,10 @@ pub fn gen_buck_content(rules: &[Rule]) -> String {
     // Build load statements based on which rule types are present
     let mut loads: Vec<Rule> = vec![];
 
-    if has_cargo_manifest {
+    if has_cargo_manifest || extra_load_symbols.contains(CARGO_MANIFEST_SYMBOL) {
         loads.push(Rule::Load(Load {
             bzl: "@buckal//:cargo_manifest.bzl".to_owned(),
-            items: Set::from(["cargo_manifest".to_owned()]),
+            items: Set::from([CARGO_MANIFEST_SYMBOL.to_owned()]),
         }));
     }
 
@@ -290,6 +311,12 @@ pub fn gen_buck_content(rules: &[Rule]) -> String {
     }
     if has_buildscript_run {
         wrapper_items.insert("buildscript_run".to_owned());
+    }
+
+    for symbol in WRAPPER_SYMBOLS {
+        if extra_load_symbols.contains(symbol) {
+            wrapper_items.insert(symbol.to_owned());
+        }
     }
 
     if !wrapper_items.is_empty() {

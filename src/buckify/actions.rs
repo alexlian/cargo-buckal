@@ -2,8 +2,11 @@ use cargo_metadata::camino::Utf8Path;
 use regex::Regex;
 
 use crate::{
-    buck::{MANUAL_SECTION_MARKER, Rule, parse_buck_file, patch_buck_rules, split_manual_section},
-    buckal_log,
+    buck::{
+        MANUAL_SECTION_MARKER, Rule, SourceStatement, parse_buck_file, parse_buck_statements,
+        patch_buck_rules, split_manual_section,
+    },
+    buckal_log, buckal_warn,
     buckify::emit::emit_export_file,
     cache::{BuckalChange, ChangeType},
     context::BuckalContext,
@@ -12,7 +15,8 @@ use crate::{
 };
 
 use super::{
-    buckify_dep_node, buckify_root_node, cross, gen_buck_content, vendor_package, windows,
+    CARGO_MANIFEST_SYMBOL, WRAPPER_SYMBOLS, buckify_dep_node, buckify_root_node, cross,
+    gen_buck_content, gen_buck_content_with_loads, vendor_package, windows,
 };
 
 impl BuckalChange {
@@ -66,8 +70,11 @@ impl BuckalChange {
                         let buck_path = vendor_dir.join("BUCK");
                         let manual = merge_rules(&buck_path, &mut buck_rules, ctx);
 
-                        // Generate the BUCK file
-                        let mut buck_content = gen_buck_content(&buck_rules);
+                        // Generate the BUCK file. Statements carried over may
+                        // call rules no generated rule uses, and those still
+                        // need binding in the header.
+                        let mut buck_content =
+                            gen_buck_content_with_loads(&buck_rules, &loads_for(&manual));
                         if !is_third_party_pkg {
                             buck_content =
                                 windows::patch_root_windows_rustc_flags(buck_content, ctx, node);
@@ -171,9 +178,97 @@ fn merge_rules(buck_path: &Utf8Path, buck_rules: &mut [Rule], ctx: &BuckalContex
     // Whatever is below the marker is the user's, and is reproduced exactly --
     // comments, blank lines and all. Re-emitting it statement by statement
     // would drop the text between statements, which is where the comments are.
-    split_manual_section(&content)
-        .map(|manual| manual.trim().to_owned())
-        .unwrap_or_default()
+    if let Some(manual) = split_manual_section(&content) {
+        return manual.trim().to_owned();
+    }
+
+    bootstrap_manual_section(&content, buck_path, buck_rules)
+}
+
+/// Infer the manual section of a file written before the marker existed.
+///
+/// This runs once per file. Everything the generator is not about to emit is
+/// treated as the user's and moved below a marker written on this run, after
+/// which ownership is recorded and never guessed again. Some of what moves may
+/// be a rule the generator itself emitted and has since stopped emitting, which
+/// is exactly what cannot be distinguished without the marker -- so say so
+/// rather than pretend otherwise.
+fn bootstrap_manual_section(content: &str, buck_path: &Utf8Path, generated: &[Rule]) -> String {
+    let statements = parse_buck_statements(content, buck_path.as_str())
+        .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
+
+    let generated_names: std::collections::BTreeSet<&str> =
+        generated.iter().filter_map(|r| r.target_name()).collect();
+
+    let kept: Vec<&str> = statements
+        .iter()
+        .filter(|stmt| {
+            // A load of a module cargo-buckal synthesizes is part of the old
+            // header and is rebuilt; a load of anything else was written by
+            // hand, and whatever it binds is needed by a statement below.
+            if stmt.is_load {
+                return !stmt
+                    .load_module
+                    .as_deref()
+                    .is_some_and(is_generated_load_module);
+            }
+            match &stmt.target_name {
+                // Buck target names are unique within a package across rule
+                // types, so a generated name always wins: keeping both would
+                // leave a package Buck cannot load.
+                Some(name) => !generated_names.contains(name.as_str()),
+                None => true,
+            }
+        })
+        .map(|stmt| stmt.text.trim_end())
+        .filter(|text| !text.is_empty())
+        .collect();
+
+    if kept.is_empty() {
+        return String::new();
+    }
+
+    buckal_warn!(
+        "{}: {} statement(s) predating the manual-section marker were moved below it. \
+         Rules you added by hand belong there; delete any left over from a target this \
+         package no longer has.",
+        buck_path,
+        kept.len()
+    );
+
+    format!("{}\n", kept.join("\n\n"))
+}
+
+fn is_generated_load_module(module: &str) -> bool {
+    matches!(
+        module,
+        "@buckal//:wrapper.bzl" | "@buckal//:cargo_manifest.bzl"
+    )
+}
+
+/// Symbols the manual section calls but does not bind itself.
+///
+/// A carried `rust_test` in a package whose generated rules contain no test
+/// would otherwise reach Buck's native `rust_test` rather than the buckal
+/// wrapper -- the file loads, and quietly builds against a different rule
+/// implementation.
+fn loads_for(manual: &str) -> std::collections::BTreeSet<String> {
+    let Ok(statements) = parse_buck_statements(manual, "manual section") else {
+        // Not parsing is the user's business; carrying the text unchanged is
+        // still right, and guessing at its imports is not.
+        return std::collections::BTreeSet::new();
+    };
+
+    let bound_here: Vec<&SourceStatement> = statements.iter().filter(|s| s.is_load).collect();
+
+    statements
+        .iter()
+        .filter_map(|stmt| stmt.call_name.as_deref())
+        .filter(|call| WRAPPER_SYMBOLS.contains(call) || *call == CARGO_MANIFEST_SYMBOL)
+        // A load the user wrote in their own section already binds it.
+        .filter(|call| !bound_here.iter().any(|load| load.text.contains(*call)))
+        .map(|call| call.to_owned())
+        .collect()
 }
 
 /// Close the generated region with the ownership marker, then re-emit the
@@ -492,5 +587,208 @@ mod tests {
             !content.contains("my_macro"),
             "--merge is what asks for carrying, got:\n{content}"
         );
+    }
+
+    /// A file written before the marker existed has its ownership inferred
+    /// once, so hand-written rules are not lost on the migration that
+    /// introduces the marker.
+    #[test]
+    fn test_legacy_file_carries_its_manual_rules_below_a_new_marker() {
+        let existing = concat!(
+            "load(\"@buckal//:wrapper.bzl\", \"rust_library\")\n\n",
+            "rust_test(\n",
+            "    name = \"hand-written-it\",\n",
+            "    srcs = glob([\"tests/**/*.rs\"]),\n",
+            "    crate = \"hand_written_it\",\n",
+            "    crate_root = \"tests/it.rs\",\n",
+            "    edition = \"2021\",\n",
+            ")\n",
+        );
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(existing, lib_only());
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        let (generated, carried) = content
+            .split_once(MANUAL_SECTION_MARKER)
+            .expect("marker written");
+        assert!(
+            carried.contains("hand-written-it"),
+            "the hand-written rule belongs below the marker, got:\n{carried}"
+        );
+        assert!(
+            carried.contains("glob([\"tests/**/*.rs\"])"),
+            "and it must arrive unchanged, got:\n{carried}"
+        );
+        assert!(
+            generated.contains("rust_library("),
+            "generated rules stay above it, got:\n{generated}"
+        );
+    }
+
+    /// The old `load(...)` header is rebuilt, not carried: it is cargo-buckal's
+    /// own, and re-emitting it would grow the file on every run.
+    #[test]
+    fn test_legacy_generated_loads_are_not_carried() {
+        let existing = concat!(
+            "load(\"@buckal//:wrapper.bzl\", \"rust_library\")\n",
+            "load(\"@buckal//:cargo_manifest.bzl\", \"cargo_manifest\")\n\n",
+            "my_macro(\n    name = \"widget\",\n)\n",
+        );
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(existing, lib_only());
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        assert_eq!(
+            content.matches("@buckal//:wrapper.bzl").count(),
+            1,
+            "the synthesized header must appear exactly once, got:\n{content}"
+        );
+        assert_eq!(
+            content.matches("@buckal//:cargo_manifest.bzl").count(),
+            1,
+            "and so must the manifest load, got:\n{content}"
+        );
+    }
+
+    /// A load of anything else was written by hand, and the statement below it
+    /// needs whatever it binds. Dropping it leaves a call with no binding.
+    #[test]
+    fn test_legacy_custom_loads_are_carried_with_their_macro() {
+        let existing = concat!(
+            "load(\"@buckal//:wrapper.bzl\", \"rust_library\")\n",
+            "load(\"//my:defs.bzl\", \"my_macro\")\n\n",
+            "my_macro(\n    name = \"widget\",\n)\n",
+        );
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(existing, lib_only());
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        assert!(
+            content.contains("load(\"//my:defs.bzl\", \"my_macro\")"),
+            "a hand-written import must survive with the call that needs it, got:\n{content}"
+        );
+        assert!(
+            content.contains("my_macro("),
+            "the macro call must survive, got:\n{content}"
+        );
+    }
+
+    /// A carried rule may name a wrapper rule that no generated rule uses. If
+    /// the header does not bind it, the file still loads -- against Buck's
+    /// *native* rule of that name rather than the buckal wrapper, which is a
+    /// different implementation and fails nowhere visible.
+    #[test]
+    fn test_carried_rules_get_their_wrapper_binding() {
+        let existing = format!(
+            concat!(
+                "# @generated by `cargo buckal`\n\n{}\n\n",
+                "rust_test(\n",
+                "    name = \"hand-written-it\",\n",
+                "    crate = \"hand_written_it\",\n",
+                "    crate_root = \"tests/it.rs\",\n",
+                "    edition = \"2021\",\n",
+                ")\n",
+            ),
+            MANUAL_SECTION_MARKER
+        );
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(&existing, lib_only());
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        let header: String = content
+            .lines()
+            .filter(|line| line.contains("wrapper.bzl"))
+            .collect();
+        assert!(
+            header.contains("rust_test"),
+            "the header must bind rust_test for the carried rule; \
+             no generated rule needs it. Header was: {header}"
+        );
+    }
+
+    /// ...but not when the manual section binds it itself, which would be a
+    /// duplicate import.
+    #[test]
+    fn test_manual_section_binding_is_not_duplicated() {
+        let existing = format!(
+            concat!(
+                "# @generated by `cargo buckal`\n\n{}\n\n",
+                "load(\"//other:defs.bzl\", \"rust_test\")\n\n",
+                "rust_test(\n",
+                "    name = \"hand-written-it\",\n",
+                ")\n",
+            ),
+            MANUAL_SECTION_MARKER
+        );
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(&existing, lib_only());
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        let header: String = content
+            .lines()
+            .filter(|line| line.contains("@buckal//:wrapper.bzl"))
+            .collect();
+        assert!(
+            !header.contains("rust_test"),
+            "the manual section already binds rust_test; the header must not \
+             shadow it. Header was: {header}"
+        );
+        assert!(
+            content.contains("load(\"//other:defs.bzl\", \"rust_test\")"),
+            "the user's own binding must survive, got:\n{content}"
+        );
+    }
+
+    /// A legacy rule whose name the generator now uses is dropped, not carried:
+    /// keeping both would leave two targets with one name.
+    #[test]
+    fn test_legacy_name_collisions_resolve_to_the_generated_rule() {
+        let existing = concat!(
+            "rust_library(\n",
+            "    name = \"myroot\",\n",
+            "    srcs = [\":vendor\"],\n",
+            "    crate = \"myroot\",\n",
+            "    crate_root = \"vendor/src/lib.rs\",\n",
+            "    edition = \"2021\",\n",
+            ")\n",
+        );
+        let specs = vec![
+            ("myroot", TargetKind::Lib, "src/lib.rs"),
+            ("myroot", TargetKind::Bin, "src/main.rs"),
+        ];
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(existing, specs);
+        change.apply(&ctx);
+
+        let content = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        assert_eq!(
+            content.matches("name = \"myroot\",").count(),
+            1,
+            "exactly one target may be named myroot, got:\n{content}"
+        );
+        assert!(
+            content.contains("name = \"myroot-lib\""),
+            "the library should be regenerated under its new name, got:\n{content}"
+        );
+    }
+
+    /// The bootstrap is a one-time guess; every run after it reads the marker.
+    #[test]
+    fn test_merge_is_idempotent_across_the_bootstrap() {
+        let existing = concat!(
+            "load(\"@buckal//:wrapper.bzl\", \"rust_library\")\n\n",
+            "# a note worth keeping\n",
+            "my_macro(\n    name = \"widget\",\n)\n",
+        );
+        let (_tmp, tmp_path, change, ctx) = merge_fixture(existing, lib_only());
+
+        change.apply(&ctx);
+        let first = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        change.apply(&ctx);
+        let second = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+        change.apply(&ctx);
+        let third = std::fs::read_to_string(tmp_path.join("BUCK")).expect("read BUCK");
+
+        assert_eq!(first, second, "second run changed the file:\n{second}");
+        assert_eq!(second, third, "third run changed the file:\n{third}");
     }
 }
