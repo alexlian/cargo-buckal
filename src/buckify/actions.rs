@@ -3,8 +3,9 @@ use regex::Regex;
 
 use crate::{
     buck::{
-        MANUAL_SECTION_MARKER, Rule, generated_region, parse_buck_content, parse_buck_file,
-        parse_buck_statements, patch_buck_rules, referenced_identifiers, split_manual_section,
+        MANUAL_SECTION_MARKER, Rule, SourceStatement, generated_region, parse_buck_content,
+        parse_buck_file, parse_buck_statements, patch_buck_rules, referenced_identifiers,
+        split_manual_section,
     },
     buckal_error, buckal_log, buckal_warn,
     buckify::emit::emit_export_file,
@@ -338,6 +339,51 @@ fn upsert_workspace_export(rules: &mut Vec<Rule>) {
     }
 }
 
+/// What to do with the workspace export in a file this writer does not own.
+#[derive(Debug, PartialEq, Eq)]
+enum WorkspaceExportPlan {
+    /// An `export_file(name = "workspace")` is already there; replace its
+    /// source range.
+    Replace(std::ops::Range<usize>),
+    /// The name is unused; append the export.
+    Append,
+    /// Something else already declares `workspace`. Names are unique across
+    /// rule types, so appending would produce a package Buck cannot load, and
+    /// replacing someone else's rule is not this writer's call. The string
+    /// names what declares it.
+    Conflict(String),
+}
+
+/// Decide how to install the workspace export, by looking at every statement
+/// that declares the name -- not only at the rule we hoped to find. A legacy
+/// file may bind `workspace` with a filegroup, or a macro this tool cannot
+/// model at all.
+fn plan_workspace_export(statements: &[SourceStatement]) -> WorkspaceExportPlan {
+    let claimants: Vec<&SourceStatement> = statements
+        .iter()
+        .filter(|stmt| stmt.target_name.as_deref() == Some("workspace"))
+        .collect();
+
+    match claimants.as_slice() {
+        [] => WorkspaceExportPlan::Append,
+        [only] if only.call_name.as_deref() == Some("export_file") => {
+            WorkspaceExportPlan::Replace(only.span.clone())
+        }
+        [other] => WorkspaceExportPlan::Conflict(
+            other
+                .call_name
+                .clone()
+                .unwrap_or_else(|| "a statement".to_owned()),
+        ),
+        many => WorkspaceExportPlan::Conflict(
+            many.iter()
+                .filter_map(|stmt| stmt.call_name.clone())
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    }
+}
+
 /// Update the workspace export inside source this writer does not own, leaving
 /// every other byte of the file alone.
 fn splice_workspace_export(content: &str, buck_path: &Utf8Path) -> String {
@@ -346,25 +392,30 @@ fn splice_workspace_export(content: &str, buck_path: &Utf8Path) -> String {
     let statements = parse_buck_statements(content, buck_path.as_str())
         .unwrap_or_exit_ctx(format!("Failed to parse {}", buck_path));
 
-    let existing = statements.iter().find(|stmt| {
-        stmt.call_name.as_deref() == Some("export_file")
-            && stmt.target_name.as_deref() == Some("workspace")
-    });
-
-    match existing {
-        Some(stmt) => {
+    match plan_workspace_export(&statements) {
+        WorkspaceExportPlan::Replace(span) => {
             let mut out = String::with_capacity(content.len() + rendered.len());
-            out.push_str(&content[..stmt.span.start]);
+            out.push_str(&content[..span.start]);
             out.push_str(rendered.trim_end());
-            out.push_str(&content[stmt.span.end..]);
+            out.push_str(&content[span.end..]);
             out
         }
-        None => {
+        WorkspaceExportPlan::Append => {
             let mut out = content.trim_end().to_owned();
             out.push_str("\n\n");
             out.push_str(rendered.trim_end());
             out.push('\n');
             out
+        }
+        WorkspaceExportPlan::Conflict(what) => {
+            buckal_error!(
+                "{}: `{}` already declares a target named `workspace`, which is the name \
+                 the workspace manifest export needs. Buck target names are unique within \
+                 a package, so this file was left unchanged. Rename that target and re-run.",
+                buck_path,
+                what
+            );
+            std::process::exit(1);
         }
     }
 }
@@ -440,7 +491,9 @@ mod tests {
     use cargo_metadata::{PackageId, camino::Utf8PathBuf};
     use daggy::Dag;
 
-    use super::{Rule, Utf8Path, colliding_target_names};
+    use super::{
+        Rule, Utf8Path, WorkspaceExportPlan, colliding_target_names, plan_workspace_export,
+    };
     use crate::{
         buck::MANUAL_SECTION_MARKER,
         cache::{BuckalChange, ChangeType},
@@ -1388,6 +1441,63 @@ mod tests {
                 && carried.contains("some_unknown_attr = \"keepme\"")
                 && carried.contains("load(\"//my:defs.bzl\", \"rust_test\")"),
             "the bootstrap must receive the original source, not a rewrite, got:\n{carried}"
+        );
+    }
+
+    /// The workspace export is installed by looking at every statement that
+    /// declares the name. Searching only for `export_file(name = "workspace")`
+    /// missed a legacy file binding that name some other way, and appended a
+    /// second target called `workspace`.
+    #[test]
+    fn test_workspace_export_plan_appends_when_the_name_is_free() {
+        let statements = crate::buck::parse_buck_statements(
+            "rust_library(\n    name = \"myroot\",\n)\n",
+            "BUCK",
+        )
+        .expect("parse");
+        assert_eq!(
+            plan_workspace_export(&statements),
+            WorkspaceExportPlan::Append
+        );
+    }
+
+    #[test]
+    fn test_workspace_export_plan_replaces_an_existing_export() {
+        let source = "export_file(\n    name = \"workspace\",\n    src = \"stale.toml\",\n)\n";
+        let statements = crate::buck::parse_buck_statements(source, "BUCK").expect("parse");
+        let plan = plan_workspace_export(&statements);
+        match plan {
+            WorkspaceExportPlan::Replace(span) => {
+                assert_eq!(&source[span], source.trim_end());
+            }
+            other => panic!("expected a replacement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_workspace_export_plan_reports_a_foreign_claim() {
+        let statements = crate::buck::parse_buck_statements(
+            "filegroup(\n    name = \"workspace\",\n    srcs = [\"README.md\"],\n)\n",
+            "BUCK",
+        )
+        .expect("parse");
+        assert_eq!(
+            plan_workspace_export(&statements),
+            WorkspaceExportPlan::Conflict("filegroup".to_owned()),
+            "another rule holding the name is a conflict, not an invitation to append"
+        );
+    }
+
+    /// Including a macro this tool cannot model, which is exactly the case a
+    /// rule-typed search cannot see.
+    #[test]
+    fn test_workspace_export_plan_reports_an_unmodelled_claim() {
+        let statements =
+            crate::buck::parse_buck_statements("my_macro(\n    name = \"workspace\",\n)\n", "BUCK")
+                .expect("parse");
+        assert_eq!(
+            plan_workspace_export(&statements),
+            WorkspaceExportPlan::Conflict("my_macro".to_owned())
         );
     }
 }
