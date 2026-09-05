@@ -167,6 +167,45 @@ cargo buckal test //... --target-platforms //platforms:x86_64-unknown-linux-gnu 
 cargo buckal test //... --target-platforms //platforms:x86_64-pc-windows-msvc -c cross.skip_test=true
 ```
 
+## Windows import-library search paths
+
+A few crates ship a prebuilt import library and print
+`cargo:rustc-link-search=native=<their lib/>` from their build script —
+`windows_x86_64_msvc`, `windows_x86_64_gnu` and `winapi-x86_64-pc-windows-gnu`.
+The `#[link(name = "windows.0.52.0")]` that needs that path is expanded in a
+*consumer* crate, so the search path has to reach whatever actually links, not
+just the crate that emitted it.
+
+Cargo does this by handing every linking unit the `-L` flags of every build
+script in its closure. cargo-buckal reproduces it by appending, to the linking
+rule's `rustc_flags`, a `select()` that pulls in those crates'
+`build-script-run[rustc_flags]` on Windows:
+
+```starlark
+rustc_flags = ["@$(location :manifest[env_flags])"] + select({
+    "prelude//os/constraints:windows": select({
+        "prelude//abi/constraints:gnu": [...],
+        "DEFAULT": [
+            "@$(location //third-party/rust/crates/windows_x86_64_msvc/0.52.6:build-script-run[rustc_flags])",
+        ],
+    }),
+    "DEFAULT": [],
+})
+```
+
+The rules that get it are the ones that link:
+
+- every `rust_binary` and `rust_test` of a first-party package, and
+- the `build-script-build` binary of **any** package — first-party or vendored —
+  that has `[build-dependencies]`.
+
+The build-script case is easy to miss because a build-script executable links
+its *build*-dependency closure, not its runtime one. Omitting it fails only at
+link time (`LNK1181: cannot open input file 'windows.0.52.0.lib'`), which no
+`check`-only build and no non-Windows host will ever surface. The crates that
+provide the search path are skipped: they have no `[build-dependencies]`, and
+patching them would point a build-script binary at its own `build-script-run`.
+
 ## Troubleshooting
 
 - If you see warnings about `rustc --print=cfg --target ...` failing, install the missing Rust targets (or expect fewer platform predicates to be mapped).
