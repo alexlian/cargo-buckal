@@ -125,9 +125,8 @@ Cargo does this by handing every linking unit the `-L` flags of every build
 script in its closure. cargo-buckal approximates it by appending, to the linking
 rule's `rustc_flags`, a `select()` that pulls in those crates'
 `build-script-run[rustc_flags]` on Windows. The set is collected from the whole
-resolve graph rather than from each rule's own closure — a linking rule may
-therefore carry a search path it does not need, which is harmless, and the same
-set is used everywhere:
+resolve graph rather than from each rule's own closure, so a linking rule may
+carry a search path it does not need:
 
 ```starlark
 rustc_flags = ["@$(location :manifest[env_flags])"] + select({
@@ -150,6 +149,16 @@ The rules that get it are the ones that link:
 That second rule is named for the package's Cargo custom-build target, not for a
 filename: `build = "custom_build.rs"` produces `build-script-custom_build`, and
 the patch follows the target rather than assuming the default.
+
+That set is not a tracked input of the cache, which has a consequence worth
+knowing. An unused search path is inert while the crate providing it is still in
+the graph. If that crate later leaves — a `cargo update` that drops the last
+dependant, say — its vendored directory is removed, but a package that only
+carried the label incidentally has an unchanged fingerprint and is not
+regenerated, so its BUCK file keeps a label pointing at a target that no longer
+exists. Buck2 then fails to load that package **on Windows**, where the `select()`
+branch carrying the label is live; other hosts take the empty branch and notice
+nothing. `cargo buckal migrate --no-cache` regenerates past it.
 
 Upgrading an existing project does not rewrite BUCK files on its own: a newer
 cargo-buckal does not change any package's cache fingerprint, so nothing is
