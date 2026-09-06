@@ -12,9 +12,6 @@ use crate::context::BuckalContext;
 use crate::resolve::{BuckalNode, is_lib_like};
 use crate::utils::{UnwrapOrExit, get_vendor_path_relative};
 
-/// The rule name buckal gives a package's build-script executable.
-const BUILD_SCRIPT_BINARY: &str = "build-script-build";
-
 /// Crates whose build script is the *source* of an import-library search path:
 /// they ship a prebuilt `.lib` and print `cargo:rustc-link-search=native=...`
 /// for it. Their own build-script binaries must never be patched — the flags
@@ -114,6 +111,10 @@ pub(super) fn patch_buildscript_windows_rustc_flags(
     ctx: &BuckalContext,
     node: &BuckalNode,
 ) -> String {
+    let Some(build_script) = build_script_target_name(node) else {
+        return buck_content;
+    };
+
     if !should_patch_buildscript(&node.name, has_build_dependencies(ctx, node)) {
         return buck_content;
     }
@@ -124,12 +125,22 @@ pub(super) fn patch_buildscript_windows_rustc_flags(
         return buck_content;
     }
 
-    apply_rustc_flags_patch_to_content(
-        &buck_content,
-        "rust_binary",
-        BUILD_SCRIPT_BINARY,
-        &select_expr,
-    )
+    apply_rustc_flags_patch_to_content(&buck_content, "rust_binary", build_script, &select_expr)
+}
+
+/// The rule name the generator gives this package's build-script executable.
+///
+/// Cargo names the target after its source file, so `build = "custom_build.rs"`
+/// produces `build-script-custom_build`, not `build-script-build`.
+/// `emit_buildscript_build` emits `build_target.name` verbatim, so this has to
+/// read the same target rather than assume the default filename -- otherwise a
+/// package with a renamed build script is silently skipped and fails to link
+/// for exactly the reason this patch exists to prevent.
+fn build_script_target_name(node: &BuckalNode) -> Option<&str> {
+    node.targets
+        .iter()
+        .find(|target| target.kind.contains(&TargetKind::CustomBuild))
+        .map(|target| target.name.as_str())
 }
 
 /// A build script that has no `[build-dependencies]` cannot have inherited a
@@ -541,7 +552,7 @@ mod tests {
         let patched = apply_rustc_flags_patch_to_content(
             input,
             "rust_binary",
-            BUILD_SCRIPT_BINARY,
+            "build-script-build",
             "select({\"DEFAULT\": []})",
         );
         assert_eq!(patched, expected);
@@ -730,6 +741,225 @@ mod tests {
         assert!(
             !has_build_dependencies(&dev_ctx, &root),
             "nor does a dev-dependency"
+        );
+    }
+
+    /// Cargo names a build-script target after its source file. `build =
+    /// "custom_build.rs"` yields `build-script-custom_build`, and
+    /// `emit_buildscript_build` emits that name, so looking for the default one
+    /// silently skips the package -- which then fails to link for exactly the
+    /// reason this patch exists to prevent.
+    #[test]
+    fn build_script_target_name_follows_the_cargo_target() {
+        use cargo_metadata::{Edition, PackageId};
+
+        use crate::resolve::{BuckalTarget, NodeKind};
+
+        fn node_with(targets: Vec<BuckalTarget>) -> BuckalNode {
+            BuckalNode {
+                package_id: PackageId {
+                    repr: "path+file://p#0.1.0".to_owned(),
+                },
+                name: "p".to_owned(),
+                version: "0.1.0".to_owned(),
+                features: vec![],
+                kind: NodeKind::FirstParty {
+                    relative_path: String::new(),
+                },
+                edition: Edition::E2021,
+                manifest_path: "/tmp/Cargo.toml".into(),
+                targets,
+                source: None,
+                links: None,
+                checksum: None,
+            }
+        }
+
+        fn target(name: &str, kind: TargetKind) -> BuckalTarget {
+            BuckalTarget {
+                name: name.to_owned(),
+                kind: vec![kind],
+                src_path: "/tmp/x.rs".into(),
+                doctest: false,
+                test: false,
+            }
+        }
+
+        let default = node_with(vec![
+            target("p", TargetKind::Lib),
+            target("build-script-build", TargetKind::CustomBuild),
+        ]);
+        assert_eq!(
+            build_script_target_name(&default),
+            Some("build-script-build")
+        );
+
+        let renamed = node_with(vec![
+            target("p", TargetKind::Lib),
+            target("build-script-custom_build", TargetKind::CustomBuild),
+        ]);
+        assert_eq!(
+            build_script_target_name(&renamed),
+            Some("build-script-custom_build"),
+            "the name comes from the Cargo target, not a filename convention"
+        );
+
+        let none = node_with(vec![target("p", TargetKind::Lib)]);
+        assert_eq!(
+            build_script_target_name(&none),
+            None,
+            "a package with no build script has no rule to patch"
+        );
+    }
+
+    /// And the patch itself must accept that name.
+    #[test]
+    fn apply_rustc_flags_patch_to_content_patches_a_renamed_build_script() {
+        let input = indoc! {r#"
+            rust_binary(
+                name = "build-script-custom_build",
+                rustc_flags = [
+                    "@$(location :manifest[env_flags])",
+                ],
+            )
+            "#};
+
+        let patched = apply_rustc_flags_patch_to_content(
+            input,
+            "rust_binary",
+            "build-script-custom_build",
+            "select({\"DEFAULT\": []})",
+        );
+        assert!(
+            patched.contains("] + select({\"DEFAULT\": []}),"),
+            "got:\n{patched}"
+        );
+    }
+
+    /// Drives the patch itself, not its parts: a package whose build script is
+    /// named after a custom source file must still have its rule patched. The
+    /// pieces below were each right in isolation while the function ignored
+    /// them, which a test of either piece alone cannot show.
+    #[test]
+    fn patch_buildscript_uses_the_packages_own_build_script_name() {
+        use cargo_metadata::{DependencyKind, Edition, PackageId, TargetKind};
+        use daggy::Dag;
+        use std::collections::HashMap;
+
+        use crate::config::RepoConfig;
+        use crate::resolve::{BuckalDep, BuckalDepKind, BuckalResolve, BuckalTarget, NodeKind};
+
+        fn target(name: &str, kind: TargetKind) -> BuckalTarget {
+            BuckalTarget {
+                name: name.to_owned(),
+                kind: vec![kind],
+                src_path: "/tmp/x.rs".into(),
+                doctest: false,
+                test: false,
+            }
+        }
+
+        fn first_party(name: &str, targets: Vec<BuckalTarget>) -> BuckalNode {
+            BuckalNode {
+                package_id: PackageId {
+                    repr: format!("path+file:///tmp/{name}#0.1.0"),
+                },
+                name: name.to_owned(),
+                version: "0.1.0".to_owned(),
+                features: vec![],
+                kind: NodeKind::FirstParty {
+                    relative_path: String::new(),
+                },
+                edition: Edition::E2021,
+                manifest_path: "/tmp/Cargo.toml".into(),
+                targets,
+                source: None,
+                links: None,
+                checksum: None,
+            }
+        }
+
+        // A provider has to be in the graph, or the select renders empty and
+        // the patch is a no-op for reasons unrelated to the name.
+        fn registry(name: &str, version: &str) -> BuckalNode {
+            BuckalNode {
+                package_id: PackageId {
+                    repr: format!(
+                        "registry+https://github.com/rust-lang/crates.io-index#{name}@{version}"
+                    ),
+                },
+                name: name.to_owned(),
+                version: version.to_owned(),
+                features: vec![],
+                kind: NodeKind::ThirdParty,
+                edition: Edition::E2021,
+                manifest_path: "/tmp/Cargo.toml".into(),
+                targets: vec![],
+                source: Some("registry".to_owned()),
+                links: None,
+                checksum: None,
+            }
+        }
+
+        let root = first_party(
+            "myroot",
+            vec![
+                target("myroot", TargetKind::Lib),
+                target("build-script-custom_build", TargetKind::CustomBuild),
+            ],
+        );
+        let helper = first_party("helper", vec![]);
+        let provider = registry("windows_x86_64_msvc", "0.52.6");
+
+        let root_id = root.package_id.clone();
+        let helper_id = helper.package_id.clone();
+        let provider_id = provider.package_id.clone();
+
+        let mut dag = Dag::new();
+        let root_idx = dag.add_node(root.clone());
+        let helper_idx = dag.add_node(helper);
+        let provider_idx = dag.add_node(provider);
+        dag.add_edge(
+            root_idx,
+            helper_idx,
+            BuckalDep {
+                name: "helper".to_owned(),
+                dep_kinds: vec![BuckalDepKind {
+                    kind: DependencyKind::Build,
+                    target: None,
+                }],
+            },
+        )
+        .expect("build edge");
+
+        let mut index_map = HashMap::new();
+        index_map.insert(root_id.clone(), root_idx);
+        index_map.insert(helper_id, helper_idx);
+        index_map.insert(provider_id, provider_idx);
+
+        let ctx = BuckalContext {
+            root: Some(root_id),
+            resolve: BuckalResolve { dag, index_map },
+            workspace_root: "/tmp".into(),
+            workspace_inherit: false,
+            no_merge: false,
+            repo_config: RepoConfig::default(),
+        };
+
+        let generated = indoc! {r#"
+            rust_binary(
+                name = "build-script-custom_build",
+                rustc_flags = [
+                    "@$(location :manifest[env_flags])",
+                ],
+            )
+            "#};
+
+        let patched = patch_buildscript_windows_rustc_flags(generated.to_owned(), &ctx, &root);
+
+        assert!(
+            patched.contains("windows_x86_64_msvc/0.52.6:build-script-run[rustc_flags]"),
+            "a renamed build script must still get the import-lib search path, got:\n{patched}"
         );
     }
 }

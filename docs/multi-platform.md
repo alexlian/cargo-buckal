@@ -122,9 +122,12 @@ The `#[link(name = "windows.0.52.0")]` that needs that path is expanded in a
 just the crate that emitted it.
 
 Cargo does this by handing every linking unit the `-L` flags of every build
-script in its closure. cargo-buckal reproduces it by appending, to the linking
+script in its closure. cargo-buckal approximates it by appending, to the linking
 rule's `rustc_flags`, a `select()` that pulls in those crates'
-`build-script-run[rustc_flags]` on Windows:
+`build-script-run[rustc_flags]` on Windows. The set is collected from the whole
+resolve graph rather than from each rule's own closure — a linking rule may
+therefore carry a search path it does not need, which is harmless, and the same
+set is used everywhere:
 
 ```starlark
 rustc_flags = ["@$(location :manifest[env_flags])"] + select({
@@ -141,8 +144,18 @@ rustc_flags = ["@$(location :manifest[env_flags])"] + select({
 The rules that get it are the ones that link:
 
 - every `rust_binary` and `rust_test` of a first-party package, and
-- the `build-script-build` binary of **any** package — first-party or vendored —
+- the build-script executable of **any** package — first-party or vendored —
   that has `[build-dependencies]`.
+
+That second rule is named for the package's Cargo custom-build target, not for a
+filename: `build = "custom_build.rs"` produces `build-script-custom_build`, and
+the patch follows the target rather than assuming the default.
+
+Upgrading an existing project does not rewrite BUCK files on its own: a newer
+cargo-buckal does not change any package's cache fingerprint, so nothing is
+regenerated until something else about the package changes. Run
+`cargo buckal migrate --no-cache` (with `--merge` if the project relies on it) to
+pick the flags up across a tree that was generated before this existed.
 
 The build-script case is easy to miss because a build-script executable links
 its *build*-dependency closure, not its runtime one. Omitting it fails only at
