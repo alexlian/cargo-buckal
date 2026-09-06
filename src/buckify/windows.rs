@@ -12,16 +12,6 @@ use crate::context::BuckalContext;
 use crate::resolve::{BuckalNode, is_lib_like};
 use crate::utils::{UnwrapOrExit, get_vendor_path_relative};
 
-/// Crates whose build script is the *source* of an import-library search path:
-/// they ship a prebuilt `.lib` and print `cargo:rustc-link-search=native=...`
-/// for it. Their own build-script binaries must never be patched — the flags
-/// would come from the very `build-script-run` that the binary feeds.
-const IMPORT_LIB_PROVIDERS: [&str; 3] = [
-    "winapi-x86_64-pc-windows-gnu",
-    "windows_x86_64_gnu",
-    "windows_x86_64_msvc",
-];
-
 #[derive(Default)]
 struct WindowsImportLibFlags {
     gnu: Vec<String>,
@@ -115,11 +105,21 @@ pub(super) fn patch_buildscript_windows_rustc_flags(
         return buck_content;
     };
 
-    if !should_patch_buildscript(&node.name, has_build_dependencies(ctx, node)) {
+    if !has_build_dependencies(ctx, node) {
         return buck_content;
     }
 
     let flags = windows_import_lib_flags(ctx);
+
+    // Never point a build-script binary at its own `build-script-run`: that
+    // runner executes this very binary, so the label would be a cycle. Asking
+    // whether the collected flags name *this* package answers that directly,
+    // and derives from the same collection above — a second list of provider
+    // crate names would be one more thing to keep in step with it.
+    if references_own_build_script(&flags, node) {
+        return buck_content;
+    }
+
     let select_expr = render_windows_rustc_flags_select(&flags);
     if select_expr.is_empty() {
         return buck_content;
@@ -143,11 +143,27 @@ fn build_script_target_name(node: &BuckalNode) -> Option<&str> {
         .map(|target| target.name.as_str())
 }
 
-/// A build script that has no `[build-dependencies]` cannot have inherited a
-/// link search from one, so leave its rule alone rather than churn every
-/// vendored BUCK that happens to carry a `build.rs`.
-fn should_patch_buildscript(package_name: &str, has_build_deps: bool) -> bool {
-    has_build_deps && !IMPORT_LIB_PROVIDERS.contains(&package_name)
+/// Whether the collected flags point at this package's own `build-script-run`.
+///
+/// True only for the crates that *provide* a search path, and derived from
+/// whatever [`windows_import_lib_flags`] collected rather than from a parallel
+/// list of their names.
+fn references_own_build_script(flags: &WindowsImportLibFlags, node: &BuckalNode) -> bool {
+    // First-party packages are not vendored and can never be providers.
+    let Ok(vendor_path) = get_vendor_path_relative(&node.package_id) else {
+        return false;
+    };
+    let own = build_script_run_flag(&vendor_path);
+    flags
+        .gnu
+        .iter()
+        .chain(flags.msvc_x86_64.iter())
+        .any(|flag| *flag == own)
+}
+
+/// The one place the label's shape is written.
+fn build_script_run_flag(vendor_path: &str) -> String {
+    format!("@$(location //{vendor_path}:build-script-run[rustc_flags])")
 }
 
 fn has_build_dependencies(ctx: &BuckalContext, node: &BuckalNode) -> bool {
@@ -172,9 +188,8 @@ fn windows_import_lib_flags(ctx: &BuckalContext) -> WindowsImportLibFlags {
             .collect();
         matches.sort_by(|a, b| a.version.cmp(&b.version));
         for node in matches {
-            out.push(format!(
-                "@$(location //{}:build-script-run[rustc_flags])",
-                get_vendor_path_relative(&node.package_id).unwrap_or_exit()
+            out.push(build_script_run_flag(
+                &get_vendor_path_relative(&node.package_id).unwrap_or_exit(),
             ));
         }
     };
@@ -556,21 +571,6 @@ mod tests {
             "select({\"DEFAULT\": []})",
         );
         assert_eq!(patched, expected);
-    }
-
-    #[test]
-    fn should_patch_buildscript_requires_build_dependencies() {
-        assert!(should_patch_buildscript("mm_proto", true));
-        // A `build.rs` with nothing under `[build-dependencies]` links only
-        // std, so there is no inherited link search to lose.
-        assert!(!should_patch_buildscript("mm_proto", false));
-    }
-
-    #[test]
-    fn should_patch_buildscript_skips_the_import_lib_providers() {
-        for provider in IMPORT_LIB_PROVIDERS {
-            assert!(!should_patch_buildscript(provider, true));
-        }
     }
 
     #[test]
@@ -960,6 +960,165 @@ mod tests {
         assert!(
             patched.contains("windows_x86_64_msvc/0.52.6:build-script-run[rustc_flags]"),
             "a renamed build script must still get the import-lib search path, got:\n{patched}"
+        );
+    }
+
+    /// A provider's own build script must not be pointed at its own
+    /// `build-script-run` -- that runner executes this very binary. The check is
+    /// derived from the collected flags, so it cannot fall out of step with the
+    /// list of crates those flags come from.
+    #[test]
+    fn a_provider_is_not_pointed_at_its_own_build_script_run() {
+        use cargo_metadata::PackageId;
+
+        let provider_id = PackageId {
+            repr:
+                "registry+https://github.com/rust-lang/crates.io-index#windows_x86_64_msvc@0.52.6"
+                    .to_owned(),
+        };
+        let vendor = get_vendor_path_relative(&provider_id).expect("vendor path");
+        let flags = WindowsImportLibFlags {
+            gnu: vec![],
+            msvc_x86_64: vec![build_script_run_flag(&vendor)],
+        };
+
+        let mut provider = mock_node();
+        provider.package_id = provider_id;
+        assert!(
+            references_own_build_script(&flags, &provider),
+            "the crate the flags come from must be recognised without naming it"
+        );
+
+        let mut other = mock_node();
+        other.package_id = PackageId {
+            repr: "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0".to_owned(),
+        };
+        assert!(!references_own_build_script(&flags, &other));
+
+        // First-party packages are not vendored and can never be providers.
+        assert!(!references_own_build_script(&flags, &mock_node()));
+    }
+
+    fn mock_node() -> BuckalNode {
+        use cargo_metadata::{Edition, PackageId};
+
+        use crate::resolve::NodeKind;
+
+        BuckalNode {
+            package_id: PackageId {
+                repr: "path+file:///tmp/p#0.1.0".to_owned(),
+            },
+            name: "p".to_owned(),
+            version: "0.1.0".to_owned(),
+            features: vec![],
+            kind: NodeKind::FirstParty {
+                relative_path: String::new(),
+            },
+            edition: Edition::E2021,
+            manifest_path: "/tmp/Cargo.toml".into(),
+            targets: vec![],
+            source: None,
+            links: None,
+            checksum: None,
+        }
+    }
+
+    /// Drives the patch, not the guard: a provider crate that happens to have a
+    /// build-dependency must come back untouched. Testing
+    /// `references_own_build_script` alone passes whether or not the patch
+    /// consults it.
+    #[test]
+    fn patch_buildscript_leaves_a_provider_alone() {
+        use cargo_metadata::{DependencyKind, Edition, PackageId, TargetKind};
+        use daggy::Dag;
+        use std::collections::HashMap;
+
+        use crate::config::RepoConfig;
+        use crate::resolve::{BuckalDep, BuckalDepKind, BuckalResolve, BuckalTarget, NodeKind};
+
+        let provider_id = PackageId {
+            repr:
+                "registry+https://github.com/rust-lang/crates.io-index#windows_x86_64_msvc@0.52.6"
+                    .to_owned(),
+        };
+        let helper_id = PackageId {
+            repr: "registry+https://github.com/rust-lang/crates.io-index#helper@1.0.0".to_owned(),
+        };
+
+        let target = |name: &str, kind: TargetKind| BuckalTarget {
+            name: name.to_owned(),
+            kind: vec![kind],
+            src_path: "/tmp/x.rs".into(),
+            doctest: false,
+            test: false,
+        };
+        let registry_node = |id: &PackageId, name: &str, targets: Vec<BuckalTarget>| BuckalNode {
+            package_id: id.clone(),
+            name: name.to_owned(),
+            version: "0.52.6".to_owned(),
+            features: vec![],
+            kind: NodeKind::ThirdParty,
+            edition: Edition::E2021,
+            manifest_path: "/tmp/Cargo.toml".into(),
+            targets,
+            source: Some("registry".to_owned()),
+            links: None,
+            checksum: None,
+        };
+
+        let provider = registry_node(
+            &provider_id,
+            "windows_x86_64_msvc",
+            vec![
+                target("windows_x86_64_msvc", TargetKind::Lib),
+                target("build-script-build", TargetKind::CustomBuild),
+            ],
+        );
+        let helper = registry_node(&helper_id, "helper", vec![]);
+
+        let mut dag = Dag::new();
+        let provider_idx = dag.add_node(provider.clone());
+        let helper_idx = dag.add_node(helper);
+        dag.add_edge(
+            provider_idx,
+            helper_idx,
+            BuckalDep {
+                name: "helper".to_owned(),
+                dep_kinds: vec![BuckalDepKind {
+                    kind: DependencyKind::Build,
+                    target: None,
+                }],
+            },
+        )
+        .expect("build edge");
+
+        let mut index_map = HashMap::new();
+        index_map.insert(provider_id, provider_idx);
+        index_map.insert(helper_id, helper_idx);
+
+        let ctx = BuckalContext {
+            root: None,
+            resolve: BuckalResolve { dag, index_map },
+            workspace_root: "/tmp".into(),
+            workspace_inherit: false,
+            no_merge: false,
+            repo_config: RepoConfig::default(),
+        };
+
+        let generated = indoc! {r#"
+            rust_binary(
+                name = "build-script-build",
+                rustc_flags = [
+                    "@$(location :manifest[env_flags])",
+                ],
+            )
+            "#};
+
+        let patched = patch_buildscript_windows_rustc_flags(generated.to_owned(), &ctx, &provider);
+
+        assert_eq!(
+            patched, generated,
+            "a provider must not be pointed at the build-script-run that runs it"
         );
     }
 }
