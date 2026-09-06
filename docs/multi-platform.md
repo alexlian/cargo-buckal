@@ -156,9 +156,12 @@ the graph. If that crate later leaves — a `cargo update` that drops the last
 dependant, say — its vendored directory is removed, but a package that only
 carried the label incidentally has an unchanged fingerprint and is not
 regenerated, so its BUCK file keeps a label pointing at a target that no longer
-exists. Buck2 then fails to load that package **on Windows**, where the `select()`
-branch carrying the label is live; other hosts take the empty branch and notice
-nothing. `cargo buckal migrate --no-cache` regenerates past it.
+exists. Buck2 then fails in analysis for that package under any **Windows target
+configuration** — that is where the `select()` branch carrying the label is live.
+This is a property of the configuration, not of the machine: a Linux host
+building with `--target-platforms //platforms:x86_64-pc-windows-msvc` hits it
+too, while a native Linux build takes the empty branch and notices nothing.
+`cargo buckal migrate --no-cache` regenerates past it.
 
 Upgrading an existing project does not rewrite BUCK files on its own: a newer
 cargo-buckal does not change any package's cache fingerprint, so nothing is
