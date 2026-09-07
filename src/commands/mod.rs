@@ -13,5 +13,6 @@ pub mod patch;
 pub mod push;
 pub mod remove;
 pub mod run;
+pub mod setup;
 pub mod test;
 pub mod update;

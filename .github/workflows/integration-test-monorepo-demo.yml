@@ -61,14 +61,23 @@ jobs:
             cargo-buckal -> target
           cache-all-crates: true
 
-      - name: Install Buck2
-        uses: ./cargo-buckal/.github/actions/install-buck2
-
       - name: Install cargo-buckal
         shell: bash
         run: |
           cd cargo-buckal
           cargo install --locked --path .
+
+      - name: Install Buck2
+        shell: bash
+        env:
+          # Unauthenticated requests to api.github.com share a small
+          # per-address quota with every other job on the runner, so the
+          # release lookup can fail with HTTP 403 for reasons unrelated
+          # to this repository. The workflow token carries its own,
+          # larger quota.
+          # https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo buckal setup -y
 
       - name: 'Step 1: cargo buckal init --repo at repo root'
         shell: bash
@@ -140,14 +149,23 @@ jobs:
             cargo-buckal -> target
           cache-all-crates: true
 
-      - name: Install Buck2
-        uses: ./cargo-buckal/.github/actions/install-buck2
-
       - name: Install cargo-buckal
         shell: bash
         run: |
           cd cargo-buckal
           cargo install --locked --path .
+
+      - name: Install Buck2
+        shell: bash
+        env:
+          # Unauthenticated requests to api.github.com share a small
+          # per-address quota with every other job on the runner, so the
+          # release lookup can fail with HTTP 403 for reasons unrelated
+          # to this repository. The workflow token carries its own,
+          # larger quota.
+          # https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo buckal setup -y
 
       - name: 'Shortcut: cargo buckal migrate --init ../.. from project/sub-lib'
         shell: bash
