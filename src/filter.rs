@@ -325,12 +325,29 @@ pub struct BuckTargetEntry {
     name: String,
 }
 
+/// Maps a Buck2 `buck.type` value to the Rust rule it names, if any.
+///
+/// The prelude has moved its rule definitions between files across Buck2
+/// releases (`prelude//rules.bzl:rust_test` became
+/// `prelude//rust/rules.bzl:rust_test`), so only the cell and the rule name
+/// after the last colon are significant; the `.bzl` path in between is not.
+fn rust_rule_kind(buck_type: &str) -> Option<TargetKind> {
+    if !buck_type.starts_with("prelude//") {
+        return None;
+    }
+    let (_, rule) = buck_type.rsplit_once(':')?;
+    match rule {
+        "rust_library" => Some(TargetKind::Lib),
+        "rust_binary" => Some(TargetKind::Bin),
+        "rust_test" => Some(TargetKind::Test),
+        _ => None,
+    }
+}
+
 impl BuckTargetEntry {
     /// Checks if this target is a Rust rule, excluding helper rules.
     pub fn is_rust_rule(&self) -> bool {
-        self.buck_type == "prelude//rules.bzl:rust_library"
-            || self.buck_type == "prelude//rules.bzl:rust_binary"
-            || self.buck_type == "prelude//rules.bzl:rust_test"
+        rust_rule_kind(&self.buck_type).is_some()
     }
 
     /// Checks if this target is third-party.
@@ -350,12 +367,7 @@ impl BuckTargetEntry {
 
     /// Returns the target kind (e.g., bin, test, bench, example, lib).
     pub fn kind(&self) -> TargetKind {
-        match self.buck_type.as_str() {
-            "prelude//rules.bzl:rust_library" => TargetKind::Lib,
-            "prelude//rules.bzl:rust_binary" => TargetKind::Bin,
-            "prelude//rules.bzl:rust_test" => TargetKind::Test,
-            _ => TargetKind::Unknown("Unsupported".into()),
-        }
+        rust_rule_kind(&self.buck_type).unwrap_or_else(|| TargetKind::Unknown("Unsupported".into()))
     }
 }
 
@@ -751,5 +763,44 @@ mod tests {
         let unsupported = mk_target("prelude//rules.bzl:filegroup", "assets");
 
         assert!(!filter.target_run(&unsupported));
+    }
+
+    #[test]
+    fn rust_rule_kinds_match_old_and_new_prelude_layouts() {
+        let cases = [
+            ("rust_library", TargetKind::Lib),
+            ("rust_binary", TargetKind::Bin),
+            ("rust_test", TargetKind::Test),
+        ];
+        for (rule, expected) in cases {
+            for prefix in ["prelude//rules.bzl", "prelude//rust/rules.bzl"] {
+                let target = mk_target(&format!("{prefix}:{rule}"), "t");
+                assert!(
+                    target.is_rust_rule(),
+                    "{prefix}:{rule} should be a rust rule"
+                );
+                assert_eq!(target.kind(), expected, "{prefix}:{rule}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_rust_and_non_prelude_rules_are_rejected() {
+        for buck_type in [
+            "prelude//rules.bzl:filegroup",
+            "prelude//rust/rules.bzl:rust_library_helper",
+            "root//defs.bzl:rust_test",
+            "rust_test",
+        ] {
+            let target = mk_target(buck_type, "t");
+            assert!(
+                !target.is_rust_rule(),
+                "{buck_type} should not be a rust rule"
+            );
+            assert!(
+                matches!(target.kind(), TargetKind::Unknown(_)),
+                "{buck_type}"
+            );
+        }
     }
 }
