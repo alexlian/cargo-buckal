@@ -89,7 +89,8 @@ silent fallback, because the defaults are not neutral.
 ignore_tests = false
 
 # Fields to preserve in existing BUCK rules when regenerating, so hand-written
-# additions survive a `migrate`. Empty by default.
+# additions survive a `migrate`. Empty by default. `run_env` (a `rust_test` field
+# that, unlike `env`, is not a rustc input) is preserved the same way.
 patch_fields = ["env"]
 
 # Redirect dependency labels from one resolved version to another.

@@ -185,6 +185,9 @@ pub struct RustTest {
     pub exec_compatible_with: Set<String>,
     #[serde(skip_serializing_if = "Map::is_empty")]
     pub env: Map<String, String>,
+    /// Run-time-only environment (`rust_test.run_env`): unlike `env`, it is not a rustc input.
+    #[serde(skip_serializing_if = "Map::is_empty")]
+    pub run_env: Map<String, String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
     pub features: Set<String>,
     #[serde(skip_serializing_if = "Set::is_empty")]
@@ -720,6 +723,7 @@ impl RustTest {
         let compatible_with = kwargs.get_list("compatible_with");
         let exec_compatible_with = kwargs.get_list("exec_compatible_with");
         let env = kwargs.get_dict("env");
+        let run_env = kwargs.get_dict("run_env");
         let features = kwargs.get_list("features");
         let rustc_flags = kwargs.get_list("rustc_flags");
         let named_deps = kwargs.get_dict("named_deps");
@@ -737,6 +741,7 @@ impl RustTest {
             compatible_with,
             exec_compatible_with,
             env,
+            run_env,
             features,
             rustc_flags,
             named_deps,
@@ -1000,6 +1005,10 @@ pub fn patch_buck_rules(
                 });
                 if let Some(Rule::RustTest(existing_rule)) = find_existing(existing, &probe) {
                     new_rule.patch_from(existing_rule, patch_fields);
+                    // `run_env` exists on rust_test only, so it is patched here, not in the shared macro.
+                    if patch_fields.contains("run_env") {
+                        patch_map(&mut new_rule.run_env, &existing_rule.run_env);
+                    }
                 }
             }
             Rule::BuildscriptRun(new_rule) => {
@@ -1819,6 +1828,48 @@ mod tests {
         );
     }
 
+    /// `patch_fields` carries a hand-written `env` / `run_env` across a regeneration, per field.
+    #[test]
+    fn test_patch_rust_test_env_and_run_env() {
+        let hand = |name: &str| RustTest {
+            name: name.to_string(),
+            env: Map::from([("A".to_string(), "hand_env".to_string())]),
+            run_env: Map::from([("B".to_string(), "hand_run_env".to_string())]),
+            ..RustTest::default()
+        };
+        let existing: Map<String, Rule> = {
+            let rule = Rule::RustTest(hand("t"));
+            Map::from([(rule_map_key(&rule), rule)])
+        };
+        let patched = |fields: &[&str]| {
+            let mut fresh = [Rule::RustTest(RustTest {
+                name: "t".to_string(),
+                ..RustTest::default()
+            })];
+            let fields: Set<String> = fields.iter().map(|f| f.to_string()).collect();
+            patch_buck_rules(&existing, &mut fresh, &fields);
+            match &fresh[0] {
+                Rule::RustTest(t) => t.clone(),
+                other => panic!("expected rust_test, got {other:?}"),
+            }
+        };
+
+        let both = patched(&["env", "run_env"]);
+        assert_eq!(both.env, hand("t").env);
+        assert_eq!(both.run_env, hand("t").run_env);
+
+        let env_only = patched(&["env"]);
+        assert_eq!(env_only.env, hand("t").env);
+        assert!(
+            env_only.run_env.is_empty(),
+            "run_env is dropped unless patched"
+        );
+
+        let run_env_only = patched(&["run_env"]);
+        assert!(run_env_only.env.is_empty());
+        assert_eq!(run_env_only.run_env, hand("t").run_env);
+    }
+
     /// Test parsing a BUCK file with a `rust_test` rule that includes all possible fields.
     #[test]
     fn test_parsing_single_rust_test() {
@@ -1835,6 +1886,10 @@ mod tests {
             compatible_with: Set::from(["prelude//os/constraints:linux".to_string()]),
             exec_compatible_with: Set::from(["prelude//os/constraints:macos".to_string()]),
             env: Map::from([("RUST_LOG".to_string(), "debug".to_string())]),
+            run_env: Map::from([(
+                "FIXTURE_BIN".to_string(),
+                "$(location :fixture)".to_string(),
+            )]),
             features: Set::from(["default".to_string()]),
             rustc_flags: Set::from(["@$(location :manifest[env_flags])".to_string()]),
             deps: Set::from([":dep".to_string()]),

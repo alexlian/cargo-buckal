@@ -8,6 +8,7 @@ rust_test(
     compatible_with = ["prelude//os/constraints:linux"],
     exec_compatible_with = ["prelude//os/constraints:macos"],
     env = {"RUST_LOG": "debug"},
+    run_env = {"FIXTURE_BIN": "$(location :fixture)"},
     features = ["default"],
     rustc_flags = ["@$(location :manifest[env_flags])"],
     deps = [":dep"],
