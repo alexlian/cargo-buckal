@@ -50,10 +50,15 @@ _OS_KEYS = {
 # Refined (os, cpu) select keys all live in the buckal cell.
 _REFINED_PREFIX = "buckal//platforms:"
 
+# Newer preludes define these in `prelude//rust/rules.bzl`; older ones in
+# `prelude//rules.bzl`. List both, or the walk silently finds no targets.
 _RUST_RULES = [
     "prelude//rules.bzl:rust_binary",
     "prelude//rules.bzl:rust_library",
     "prelude//rules.bzl:rust_test",
+    "prelude//rust/rules.bzl:rust_binary",
+    "prelude//rust/rules.bzl:rust_library",
+    "prelude//rust/rules.bzl:rust_test",
 ]
 
 # `wrapper.bzl` merges `os_deps` into `deps` and `os_named_deps` into

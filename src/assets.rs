@@ -199,8 +199,28 @@ fn extract_dir(dest: &Path, dir: &Dir) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_buck2_assets, platform_blocks, upgrade_platform_assets};
+    use super::{PLATFORMS_ASSET, extract_buck2_assets, platform_blocks, upgrade_platform_assets};
     use tempfile::TempDir;
+
+    /// `verify_deps.bxl` filters nodes on `rule_type`, which names the `.bzl`
+    /// file the prelude defines the rule in. That file moved from
+    /// `prelude//rules.bzl` to `prelude//rust/rules.bzl`; a list carrying only
+    /// one spelling makes `check` pass vacuously on the other prelude.
+    #[test]
+    fn verify_deps_bxl_lists_rust_rules_for_both_prelude_layouts() {
+        let bxl = PLATFORMS_ASSET
+            .get_file("verify_deps.bxl")
+            .and_then(|f| f.contents_utf8())
+            .expect("embedded verify_deps.bxl");
+        let start = bxl.find("_RUST_RULES = [").expect("_RUST_RULES list");
+        let list = &bxl[start..start + bxl[start..].find(']').expect("list end")];
+        for prefix in ["prelude//rules.bzl", "prelude//rust/rules.bzl"] {
+            for rule in ["rust_binary", "rust_library", "rust_test"] {
+                let entry = format!("\"{prefix}:{rule}\"");
+                assert!(list.contains(&entry), "_RUST_RULES is missing {entry}");
+            }
+        }
+    }
 
     /// A `platforms/BUCK` as an older cargo-buckal generated it: four of the
     /// six pairs, plus the sort of hand-written additions real repos collect.
